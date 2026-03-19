@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
 import * as path from "node:path";
 
-const CLI = path.resolve(import.meta.dir, "../../dist/cli.js");
+const CLI = path.resolve(import.meta.dir, "../../dist/cli-main.js");
 
 /**
  * Spawn the tallow CLI with given args and env overrides.

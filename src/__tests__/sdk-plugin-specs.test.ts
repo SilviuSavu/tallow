@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { collectPluginSpecs } from "../sdk.js";
+import { collectPluginSpecs } from "../sdk-client.js";
 
 let cwd: string;
 let tallowHome: string;

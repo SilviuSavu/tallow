@@ -119,7 +119,8 @@ function writeLegacyPidFile(entries: TestPidEntry[]): void {
 function readSessionPidEntries(owner: TestSessionOwner): TestPidEntry[] {
 	const path = getSessionPidFilePath(owner);
 	if (!existsSync(path)) {
-		return [];
+		const noEntries: TestPidEntry[] = [];
+		return noEntries;
 	}
 	const parsed = JSON.parse(readFileSync(path, "utf-8")) as {
 		entries?: TestPidEntry[];
@@ -134,7 +135,8 @@ function readSessionPidEntries(owner: TestSessionOwner): TestPidEntry[] {
  */
 function listSessionPidFiles(): string[] {
 	if (!existsSync(sessionPidDir)) {
-		return [];
+		const noFiles: string[] = [];
+		return noFiles;
 	}
 	return readdirSync(sessionPidDir)
 		.filter((entry) => entry.endsWith(".json"))
@@ -184,9 +186,11 @@ function killProcessGroup(pid: number, signal: NodeJS.Signals): void {
 function isAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
+		const alive = true;
+		return alive;
 	} catch {
-		return false;
+		const notAlive = false;
+		return notAlive;
 	}
 }
 
@@ -202,7 +206,8 @@ function readProcessStartedAt(pid: number): string | null {
 		stdio: ["ignore", "pipe", "ignore"],
 	});
 	if (result.error || result.status !== 0) {
-		return null;
+		const unavailable = null;
+		return unavailable;
 	}
 	const startedAt = result.stdout.trim();
 	return startedAt.length > 0 ? startedAt : null;
@@ -242,12 +247,14 @@ async function waitForExit(pid: number): Promise<boolean> {
 
 	while (Date.now() - startedAt < timeoutMs) {
 		if (!isAlive(pid)) {
-			return true;
+			const exited = true;
+			return exited;
 		}
 		await new Promise((resolve) => setTimeout(resolve, 25));
 	}
 
-	return false;
+	const timedOut = false;
+	return timedOut;
 }
 
 describe("pid-manager", () => {

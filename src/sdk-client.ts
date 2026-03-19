@@ -29,7 +29,7 @@ import {
 import * as PiTui from "@mariozechner/pi-tui";
 import { atomicWriteFileSync } from "./atomic-write.js";
 import { createSecureAuthStorage, resolveRuntimeApiKeyFromEnv } from "./auth-hardening.js";
-import { BUNDLED, bootstrap, resolveOpSecrets, TALLOW_HOME, TALLOW_VERSION } from "./config.js";
+import { BUNDLED, bootstrap, resolveOpSecrets, TALLOW_HOME, TALLOW_VERSION } from "./app-config.js";
 import { applyInteractiveModeStaleUiPatch } from "./interactive-mode-patch.js";
 import { cleanupOrphanPids } from "./pid-manager.js";
 import {
@@ -38,7 +38,7 @@ import {
 	readPluginManifest,
 	resolvePlugins,
 	type TallowExtensionManifest,
-} from "./plugins.js";
+} from "./plugin-system.js";
 import {
 	applyProjectTrustContextToEnv,
 	type ProjectTrustContext,
@@ -245,7 +245,8 @@ export function parseToolFlag(toolString: string): ToolArray {
 		.filter(Boolean);
 
 	if (names.length === 0) {
-		return [];
+		const noTools: ToolArray = [];
+		return noTools;
 	}
 
 	// Check for preset alias (only when single value)
@@ -380,9 +381,16 @@ export function applyToolResultRetentionToMessages(
 function readToolResultRetentionConfig(
 	settings: Record<string, unknown> | undefined
 ): ToolResultRetentionConfigInput {
-	if (!settings) return {};
+	if (!settings) {
+		const noSettings: ToolResultRetentionConfigInput = {};
+		return noSettings;
+	}
 	const config = settings.toolResultRetention;
-	return isObjectRecord(config) ? (config as ToolResultRetentionConfigInput) : {};
+	if (isObjectRecord(config)) {
+		return config as ToolResultRetentionConfigInput;
+	}
+	const emptyConfig: ToolResultRetentionConfigInput = {};
+	return emptyConfig;
 }
 
 /**
@@ -415,11 +423,15 @@ function isObjectRecord(value: unknown): value is Record<string, unknown> {
  * @returns UTF-8 byte length of JSON representation, or 0 when unavailable
  */
 function safeJsonByteLength(value: unknown): number {
-	if (value == null) return 0;
+	if (value == null) {
+		const noValue = 0;
+		return noValue;
+	}
 	try {
 		return Buffer.byteLength(JSON.stringify(value), "utf-8");
 	} catch {
-		return 0;
+		const serializeFailed = 0;
+		return serializeFailed;
 	}
 }
 
@@ -457,7 +469,10 @@ function estimateToolResultPayloadBytes(result: ToolResultMessageLike): ToolResu
  * @returns True when details include the retention marker
  */
 function isRetentionSummarized(details: unknown): boolean {
-	if (!isObjectRecord(details)) return false;
+	if (!isObjectRecord(details)) {
+		const notRecord = false;
+		return notRecord;
+	}
 	return details[TOOL_RESULT_RETENTION_MARKER] === true;
 }
 
@@ -561,12 +576,25 @@ function summarizeHistoricalToolResultInPlace(
  * @returns True when value matches the minimal toolResult shape used by retention
  */
 function isToolResultMessageLike(value: unknown): value is ToolResultMessageLike {
-	if (!isObjectRecord(value)) return false;
-	if (value.role !== "toolResult") return false;
-	if (typeof value.toolCallId !== "string") return false;
-	if (typeof value.toolName !== "string") return false;
-	if (typeof value.isError !== "boolean") return false;
-	if (typeof value.timestamp !== "number") return false;
+	const invalid = false;
+	if (!isObjectRecord(value)) {
+		return invalid;
+	}
+	if (value.role !== "toolResult") {
+		return invalid;
+	}
+	if (typeof value.toolCallId !== "string") {
+		return invalid;
+	}
+	if (typeof value.toolName !== "string") {
+		return invalid;
+	}
+	if (typeof value.isError !== "boolean") {
+		return invalid;
+	}
+	if (typeof value.timestamp !== "number") {
+		return invalid;
+	}
 	return Array.isArray(value.content);
 }
 
@@ -652,7 +680,8 @@ export function getBundledExtensionCatalog(
 			try {
 				return statSync(fullPath).isDirectory();
 			} catch {
-				return false;
+				const statFailed = false;
+				return statFailed;
 			}
 		})
 		.map((fullPath) => {
@@ -763,7 +792,8 @@ export function resolveExtensionSelectors(
 	} = {}
 ): string[] {
 	if (!selectors || selectors.length === 0) {
-		return [];
+		const noSelectors: string[] = [];
+		return noSelectors;
 	}
 
 	const resolved = selectors.map((selector) => resolveExtensionSelector(selector, options).path);
@@ -953,8 +983,9 @@ function shouldSkipInteractiveUiExtensionInHeadless(
 	extensionPath: string,
 	runtimeToolCount: number
 ): boolean {
+	const doNotSkip = false;
 	if (runtimeToolCount > 0) {
-		return false;
+		return doNotSkip;
 	}
 
 	const manifest = readPluginManifest(
@@ -962,12 +993,12 @@ function shouldSkipInteractiveUiExtensionInHeadless(
 		"tallow-extension"
 	) as TallowExtensionManifest | null;
 	if (!manifest) {
-		return false;
+		return doNotSkip;
 	}
 
 	const declaredToolCount = manifest.capabilities?.tools?.length ?? 0;
 	if (declaredToolCount > 0) {
-		return false;
+		return doNotSkip;
 	}
 
 	return manifest.category?.toLowerCase() === "ui";
@@ -1487,7 +1518,10 @@ interface AgentsFile {
  */
 function loadAgentsFilesFromPackages(settingsManager: SettingsManager, cwd: string): AgentsFile[] {
 	const packages = settingsManager.getPackages();
-	if (packages.length === 0) return [];
+	if (packages.length === 0) {
+		const noPackages: AgentsFile[] = [];
+		return noPackages;
+	}
 
 	// Use a PackageManager to resolve installed paths for all source types
 	const pkgManager = new DefaultPackageManager({

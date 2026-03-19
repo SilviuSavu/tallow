@@ -1,5 +1,5 @@
 /**
- * Tests for src/config.ts — identity constants, path resolution, demo mode,
+ * Tests for src/app-config.ts — identity constants, path resolution, demo mode,
  * .env parsing, and bootstrap behavior.
  *
  * Tests that touch process.env save/restore original values in afterEach
@@ -61,24 +61,24 @@ afterEach(() => {
 
 describe("identity constants", () => {
 	test("APP_NAME is tallow", async () => {
-		const { APP_NAME } = await import("../config.js");
+		const { APP_NAME } = await import("../app-config.js");
 		expect(APP_NAME).toBe("tallow");
 	});
 
 	test("CONFIG_DIR is .tallow", async () => {
-		const { CONFIG_DIR } = await import("../config.js");
+		const { CONFIG_DIR } = await import("../app-config.js");
 		expect(CONFIG_DIR).toBe(".tallow");
 	});
 
 	test("TALLOW_VERSION matches semver pattern", async () => {
-		const { TALLOW_VERSION } = await import("../config.js");
+		const { TALLOW_VERSION } = await import("../app-config.js");
 		expect(TALLOW_VERSION).toMatch(/^\d+\.\d+\.\d+/);
 	});
 });
 
 describe("BUNDLED paths", () => {
 	test("BUNDLED paths reference existing directories", async () => {
-		const { BUNDLED } = await import("../config.js");
+		const { BUNDLED } = await import("../app-config.js");
 		expect(existsSync(BUNDLED.extensions)).toBe(true);
 		expect(existsSync(BUNDLED.skills)).toBe(true);
 		expect(existsSync(BUNDLED.themes)).toBe(true);
@@ -87,7 +87,7 @@ describe("BUNDLED paths", () => {
 
 describe("TEMPLATES paths", () => {
 	test("TEMPLATES paths reference existing directories", async () => {
-		const { TEMPLATES } = await import("../config.js");
+		const { TEMPLATES } = await import("../app-config.js");
 		expect(existsSync(TEMPLATES.agents)).toBe(true);
 		expect(existsSync(TEMPLATES.commands)).toBe(true);
 	});
@@ -97,28 +97,28 @@ describe("isDemoMode", () => {
 	test("returns false when no demo env vars are set", async () => {
 		delete process.env.IS_DEMO;
 		delete process.env.TALLOW_DEMO;
-		const { isDemoMode } = await import("../config.js");
+		const { isDemoMode } = await import("../app-config.js");
 		expect(isDemoMode()).toBe(false);
 	});
 
 	test("returns true when IS_DEMO=1", async () => {
 		process.env.IS_DEMO = "1";
 		delete process.env.TALLOW_DEMO;
-		const { isDemoMode } = await import("../config.js");
+		const { isDemoMode } = await import("../app-config.js");
 		expect(isDemoMode()).toBe(true);
 	});
 
 	test("returns true when TALLOW_DEMO=1", async () => {
 		delete process.env.IS_DEMO;
 		process.env.TALLOW_DEMO = "1";
-		const { isDemoMode } = await import("../config.js");
+		const { isDemoMode } = await import("../app-config.js");
 		expect(isDemoMode()).toBe(true);
 	});
 
 	test("returns false when demo vars are set to non-1 values", async () => {
 		process.env.IS_DEMO = "0";
 		process.env.TALLOW_DEMO = "false";
-		const { isDemoMode } = await import("../config.js");
+		const { isDemoMode } = await import("../app-config.js");
 		expect(isDemoMode()).toBe(false);
 	});
 });
@@ -127,7 +127,7 @@ describe("sanitizePath", () => {
 	test("returns path unchanged when demo mode is off", async () => {
 		delete process.env.IS_DEMO;
 		delete process.env.TALLOW_DEMO;
-		const { sanitizePath } = await import("../config.js");
+		const { sanitizePath } = await import("../app-config.js");
 		const path = "/Users/kevin/dev/tallow/src/config.ts";
 		expect(sanitizePath(path)).toBe(path);
 	});
@@ -135,14 +135,14 @@ describe("sanitizePath", () => {
 	test("replaces username with demo when demo mode is active", async () => {
 		process.env.IS_DEMO = "1";
 		process.env.USER = "kevin";
-		const { sanitizePath } = await import("../config.js");
+		const { sanitizePath } = await import("../app-config.js");
 		expect(sanitizePath("/Users/kevin/dev/tallow")).toBe("/Users/demo/dev/tallow");
 	});
 
 	test("replaces multiple username occurrences in a path", async () => {
 		process.env.IS_DEMO = "1";
 		process.env.USER = "kevin";
-		const { sanitizePath } = await import("../config.js");
+		const { sanitizePath } = await import("../app-config.js");
 		expect(sanitizePath("/Users/kevin/dev/kevin/project")).toBe("/Users/demo/dev/demo/project");
 	});
 
@@ -150,7 +150,7 @@ describe("sanitizePath", () => {
 		process.env.IS_DEMO = "1";
 		delete process.env.USER;
 		delete process.env.USERNAME;
-		const { sanitizePath } = await import("../config.js");
+		const { sanitizePath } = await import("../app-config.js");
 		const path = "/Users/someone/dev";
 		expect(sanitizePath(path)).toBe(path);
 	});
@@ -158,7 +158,7 @@ describe("sanitizePath", () => {
 	test("handles trailing username in path", async () => {
 		process.env.IS_DEMO = "1";
 		process.env.USER = "kevin";
-		const { sanitizePath } = await import("../config.js");
+		const { sanitizePath } = await import("../app-config.js");
 		expect(sanitizePath("/home/kevin")).toBe("/home/demo");
 	});
 
@@ -166,14 +166,14 @@ describe("sanitizePath", () => {
 		process.env.IS_DEMO = "1";
 		delete process.env.USER;
 		process.env.USERNAME = "winuser";
-		const { sanitizePath } = await import("../config.js");
+		const { sanitizePath } = await import("../app-config.js");
 		expect(sanitizePath("/Users/winuser/project")).toBe("/Users/demo/project");
 	});
 });
 
 describe("getRuntimeTallowHome", () => {
 	test("returns TALLOW_HOME when env override is not set", async () => {
-		const { getRuntimeTallowHome, TALLOW_HOME } = await import("../config.js");
+		const { getRuntimeTallowHome, TALLOW_HOME } = await import("../app-config.js");
 		const original = process.env.TALLOW_HOME;
 		delete process.env.TALLOW_HOME;
 		const result = getRuntimeTallowHome();
@@ -183,7 +183,7 @@ describe("getRuntimeTallowHome", () => {
 	});
 
 	test("returns env override when TALLOW_HOME is set", async () => {
-		const { getRuntimeTallowHome } = await import("../config.js");
+		const { getRuntimeTallowHome } = await import("../app-config.js");
 		const original = process.env.TALLOW_HOME;
 		process.env.TALLOW_HOME = "/tmp/override-home";
 		const result = getRuntimeTallowHome();
@@ -199,7 +199,7 @@ describe("getRuntimeTallowHome", () => {
 
 describe("getRuntimePathProvider / setRuntimePathProviderForTests", () => {
 	test("returns default provider when no override is set", async () => {
-		const { getRuntimePathProvider, setRuntimePathProviderForTests } = await import("../config.js");
+		const { getRuntimePathProvider, setRuntimePathProviderForTests } = await import("../app-config.js");
 		setRuntimePathProviderForTests(); // reset
 		const provider = getRuntimePathProvider();
 		expect(typeof provider.getHomeDir).toBe("function");
@@ -207,7 +207,7 @@ describe("getRuntimePathProvider / setRuntimePathProviderForTests", () => {
 	});
 
 	test("returns override provider when set, and resets on undefined", async () => {
-		const { getRuntimePathProvider, setRuntimePathProviderForTests } = await import("../config.js");
+		const { getRuntimePathProvider, setRuntimePathProviderForTests } = await import("../app-config.js");
 		const { createStaticRuntimePathProvider } = await import("../runtime-path-provider.js");
 
 		const custom = createStaticRuntimePathProvider("/tmp/custom-home");
@@ -223,7 +223,7 @@ describe("getRuntimePathProvider / setRuntimePathProviderForTests", () => {
 
 describe("bootstrap side effects", () => {
 	test("sets process.title to tallow", async () => {
-		const { bootstrap } = await import("../config.js");
+		const { bootstrap } = await import("../app-config.js");
 		const originalTitle = process.title;
 		bootstrap();
 		expect(process.title).toBe("tallow");
@@ -233,7 +233,7 @@ describe("bootstrap side effects", () => {
 
 describe("env var module-scope exports", () => {
 	test("PI_PACKAGE_DIR is set to PACKAGE_DIR", async () => {
-		const { PACKAGE_DIR } = await import("../config.js");
+		const { PACKAGE_DIR } = await import("../app-config.js");
 		expect(process.env.PI_PACKAGE_DIR).toBe(PACKAGE_DIR);
 	});
 
@@ -244,7 +244,7 @@ describe("env var module-scope exports", () => {
 
 describe("resolveOpSecrets", () => {
 	test("no-ops when .env file does not exist", async () => {
-		const { resolveOpSecrets } = await import("../config.js");
+		const { resolveOpSecrets } = await import("../app-config.js");
 		// This should not throw even when TALLOW_HOME points to a non-existent dir.
 		// The function catches the file-read error and returns early.
 		await expect(resolveOpSecrets()).resolves.toBeUndefined();

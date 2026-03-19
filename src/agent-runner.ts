@@ -28,7 +28,7 @@ const DEFAULT_PRIMARY_COMMAND = "tallow";
 /** Default legacy fallback command for backward compatibility. */
 const DEFAULT_LEGACY_COMMANDS = ["pi"] as const;
 /** Default entrypoint suffixes that identify tallow CLI scripts. */
-const DEFAULT_ENTRYPOINT_SUFFIXES = ["/dist/cli.js"] as const;
+const DEFAULT_ENTRYPOINT_SUFFIXES = ["/dist/cli-main.js"] as const;
 
 /**
  * Normalize path-like values for comparison.
@@ -56,8 +56,14 @@ function isCurrentCliEntrypoint(
 	const normalizedEntrypoint = normalizePathToken(entrypoint);
 	const normalizedPrimary = normalizePathToken(primaryCommand);
 
-	if (normalizedEntrypoint === normalizedPrimary) return true;
-	if (normalizedEntrypoint.includes(`/${normalizedPrimary}`)) return true;
+	if (normalizedEntrypoint === normalizedPrimary) {
+		const exactMatch = true;
+		return exactMatch;
+	}
+	if (normalizedEntrypoint.includes(`/${normalizedPrimary}`)) {
+		const pathMatch = true;
+		return pathMatch;
+	}
 	return entrypointSuffixes.some((suffix) =>
 		normalizedEntrypoint.endsWith(normalizePathToken(suffix))
 	);
@@ -75,13 +81,15 @@ function resolveCurrentProcessCandidate(
 	const argv = options.argv ?? process.argv;
 	const entrypoint = argv[1];
 	if (!entrypoint) {
-		return null;
+		const noEntrypoint = null;
+		return noEntrypoint;
 	}
 
 	const primaryCommand = options.primaryCommand ?? DEFAULT_PRIMARY_COMMAND;
 	const entrypointSuffixes = options.entrypointSuffixes ?? DEFAULT_ENTRYPOINT_SUFFIXES;
 	if (!isCurrentCliEntrypoint(entrypoint, primaryCommand, entrypointSuffixes)) {
-		return null;
+		const notCurrentCli = null;
+		return notCurrentCli;
 	}
 
 	if (/\.(c|m)?js$/i.test(entrypoint)) {

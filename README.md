@@ -47,7 +47,7 @@ git clone https://github.com/dungle-scrubs/tallow.git
 cd tallow
 bun install
 bun run build
-node dist/install.js
+node dist/install-flow.js
 ```
 
 The installer walks you through selecting extensions, themes, and agents,

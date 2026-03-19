@@ -14,7 +14,10 @@ const DISABLED_VALUES = new Set(["0", "false", "off", "no"]);
  */
 export function isStartupTimingEnabled(): boolean {
 	const raw = process.env[STARTUP_TIMING_ENV];
-	if (!raw) return false;
+	if (!raw) {
+		const notEnabled = false;
+		return notEnabled;
+	}
 	return !DISABLED_VALUES.has(raw.trim().toLowerCase());
 }
 

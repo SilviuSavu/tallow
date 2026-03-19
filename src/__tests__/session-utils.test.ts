@@ -93,14 +93,18 @@ function makeTempDir(): string {
  * @returns Path to the session file, or null if not found
  */
 function findSessionByIdInDir(sessionId: string, sessionsDir: string): string | null {
-	if (!existsSync(sessionsDir)) return null;
+	if (!existsSync(sessionsDir)) {
+		const noDir = null;
+		return noDir;
+	}
 
 	const { readdirSync } = require("node:fs");
 	let files: string[];
 	try {
 		files = readdirSync(sessionsDir).filter((f: string) => f.endsWith(".jsonl"));
 	} catch {
-		return null;
+		const readFailed = null;
+		return readFailed;
 	}
 
 	// Fast path: filename suffix
@@ -123,7 +127,8 @@ function findSessionByIdInDir(sessionId: string, sessionsDir: string): string | 
 		}
 	}
 
-	return null;
+	const notFound = null;
+	return notFound;
 }
 
 describe("findSessionById (logic)", () => {

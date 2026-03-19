@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { createMockModel } from "../../test-utils/mock-model.js";
-import { createTallowSession, parseToolFlag, type TallowSession } from "../sdk.js";
+import { createTallowSession, parseToolFlag, type TallowSession } from "../sdk-client.js";
 
 const tempDirs: string[] = [];
 const sessionDisposers: Array<() => void> = [];

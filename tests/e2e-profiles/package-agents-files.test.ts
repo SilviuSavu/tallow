@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { trustProject } from "../../src/project-trust.js";
-import { createTallowSession, type TallowSession } from "../../src/sdk.js";
+import { createTallowSession, type TallowSession } from "../../src/sdk-client.js";
 import { createMockModel } from "../../test-utils/mock-model.js";
 
 const cleanupDirs: string[] = [];

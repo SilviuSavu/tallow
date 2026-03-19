@@ -124,7 +124,10 @@ function backupFileSync(filePath: string): void {
 export function restoreFromBackup(filePath: string, validate?: (content: string) => void): boolean {
 	const bakPath = `${filePath}.bak`;
 
-	if (!existsSync(bakPath)) return false;
+	if (!existsSync(bakPath)) {
+		const noBackup = false;
+		return noBackup;
+	}
 
 	try {
 		const content = readFileSync(bakPath, "utf-8");
@@ -136,8 +139,10 @@ export function restoreFromBackup(filePath: string, validate?: (content: string)
 
 		// Atomically restore (no backup of the backup)
 		atomicWriteFileSync(filePath, content);
-		return true;
+		const restored = true;
+		return restored;
 	} catch {
-		return false;
+		const restoreFailed = false;
+		return restoreFailed;
 	}
 }

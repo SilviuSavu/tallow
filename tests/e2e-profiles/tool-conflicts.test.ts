@@ -7,7 +7,7 @@
  */
 
 import { afterEach, describe, it } from "bun:test";
-import type { TallowSession } from "../../src/sdk.js";
+import type { TallowSession } from "../../src/sdk-client.js";
 import {
 	createProfileSession,
 	getRegisteredCommandNames,

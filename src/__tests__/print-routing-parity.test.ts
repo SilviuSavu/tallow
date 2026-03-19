@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const CLI = resolve(import.meta.dir, "../../dist/cli.js");
+const CLI = resolve(import.meta.dir, "../../dist/cli-main.js");
 const INVALID_MODEL = "tallow-test-provider/tallow-test-model";
 const NESTED_GUARD_ERROR = "Cannot start interactive tallow inside an existing interactive session";
 const MODEL_NOT_FOUND_ERROR = `Model ${INVALID_MODEL} not found`;

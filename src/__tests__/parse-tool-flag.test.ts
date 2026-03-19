@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseToolFlag } from "../sdk.js";
+import { parseToolFlag } from "../sdk-client.js";
 
 describe("parseToolFlag", () => {
 	test("parses single tool name", () => {

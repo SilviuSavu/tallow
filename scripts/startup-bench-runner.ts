@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 
-import { createTallowSession } from "../src/sdk.js";
+import { createTallowSession } from "../src/sdk-client.js";
 import { createMockModel, createScriptedStreamFn } from "../test-utils/mock-model.js";
 
 /**

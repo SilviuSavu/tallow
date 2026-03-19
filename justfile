@@ -74,7 +74,7 @@ test-e2e:
 
 # Run tallow interactively (from built dist)
 run:
-    bun dist/cli.js
+    bun dist/cli-main.js
 
 # Alias for run
 start: run
@@ -82,11 +82,11 @@ start: run
 # Run tallow with a single-shot prompt
 # Usage: just prompt "Fix the tests"
 prompt msg:
-    bun dist/cli.js -p "{{ msg }}"
+    bun dist/cli-main.js -p "{{ msg }}"
 
 # Run the interactive installer
 install:
-    bun dist/install.js
+    bun dist/install-flow.js
 
 # ── Docs ──────────────────────────────────────────
 

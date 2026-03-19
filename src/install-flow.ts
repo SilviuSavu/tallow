@@ -5,7 +5,7 @@
  *
  * Usage:
  *   npx tallow install             (after global install)
- *   node dist/install.js           (from source)
+ *   node dist/install-flow.js      (from source)
  *
  * Flags:
  *   --yes, -y                Non-interactive: rebuild + reinstall, keep all settings.
@@ -70,11 +70,17 @@ interface InstallChoices {
 // ─── Discovery ───────────────────────────────────────────────────────────────
 
 function discoverExtensions(dir: string): readonly ExtensionInfo[] {
-	if (!existsSync(dir)) return [];
+	if (!existsSync(dir)) {
+		const noDir: readonly ExtensionInfo[] = [];
+		return noDir;
+	}
 
 	return readdirSync(dir)
 		.filter((entry) => {
-			if (entry.startsWith(".") || entry === "node_modules") return false;
+			if (entry.startsWith(".") || entry === "node_modules") {
+				const skip = false;
+				return skip;
+			}
 			const full = join(dir, entry);
 			return existsSync(join(full, "index.ts"));
 		})
@@ -91,7 +97,10 @@ function discoverExtensions(dir: string): readonly ExtensionInfo[] {
 }
 
 function discoverThemes(dir: string): readonly ThemeInfo[] {
-	if (!existsSync(dir)) return [];
+	if (!existsSync(dir)) {
+		const noDir: readonly ThemeInfo[] = [];
+		return noDir;
+	}
 
 	return readdirSync(dir)
 		.filter((f) => f.endsWith(".json"))
@@ -127,13 +136,16 @@ function readSettings(): Record<string, unknown> {
 				try {
 					return JSON.parse(readFileSync(SETTINGS_PATH, "utf-8")) as Record<string, unknown>;
 				} catch {
-					return {};
-				}
+				const noSettings: Record<string, unknown> = {};
+				return noSettings;
 			}
-			return {};
+			}
+			const emptyAfterCorruption: Record<string, unknown> = {};
+			return emptyAfterCorruption;
 		}
 	}
-	return {};
+	const defaultSettings: Record<string, unknown> = {};
+	return defaultSettings;
 }
 
 /**
@@ -383,7 +395,10 @@ interface ExistingInstall {
 }
 
 function detectExistingInstall(): ExistingInstall | undefined {
-	if (!existsSync(TALLOW_HOME)) return undefined;
+	if (!existsSync(TALLOW_HOME)) {
+		const noInstall = undefined;
+		return noInstall;
+	}
 
 	const settings = readSettings();
 

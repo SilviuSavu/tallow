@@ -16,7 +16,7 @@ git clone https://github.com/dungle-scrubs/tallow.git
 cd tallow
 bun install
 bun run build
-node dist/install.js
+node dist/install-flow.js
 ```
 
 The installer walks you through:
@@ -40,15 +40,15 @@ directory for any custom extensions you add later.
 For CI, scripts, or quick rebuilds, pass `--yes` (or `-y`):
 
 ```bash
-node dist/install.js --yes
+node dist/install-flow.js --yes
 ```
 
 For headless auth bootstrapping, provide credentials via env vars
 (not CLI args):
 
 ```bash
-TALLOW_API_KEY=sk-ant-... node dist/install.js --yes --default-provider anthropic
-TALLOW_API_KEY_REF=op://Services/Anthropic/api-key node dist/install.js --yes --default-provider anthropic
+TALLOW_API_KEY=sk-ant-... node dist/install-flow.js --yes --default-provider anthropic
+TALLOW_API_KEY_REF=op://Services/Anthropic/api-key node dist/install-flow.js --yes --default-provider anthropic
 ```
 
 This rebuilds from source, reinstalls the global binary, and
@@ -72,7 +72,7 @@ You can also upgrade non-interactively:
 ```bash
 cd /path/to/tallow
 git pull
-node dist/install.js --yes
+node dist/install-flow.js --yes
 ```
 
 ## After installation

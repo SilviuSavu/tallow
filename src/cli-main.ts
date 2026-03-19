@@ -19,7 +19,7 @@ import {
 	sanitizePath,
 	TALLOW_HOME,
 	TALLOW_VERSION,
-} from "./config.js";
+} from "./app-config.js";
 
 bootstrap();
 
@@ -52,7 +52,7 @@ import {
 	parseToolFlag,
 	resolveExtensionSelectors,
 	type TallowSessionOptions,
-} from "./sdk.js";
+} from "./sdk-client.js";
 import { resolveStartupProfile } from "./startup-profile.js";
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
@@ -135,7 +135,7 @@ program
 	)
 	.action(async () => {
 		// Dynamically import so the main CLI stays lightweight
-		await import("./install.js");
+		await import("./install-flow.js");
 	});
 
 program
@@ -788,7 +788,10 @@ const MAX_STDIN_BYTES = 10 * 1024 * 1024;
  * @throws {Error} When stdin exceeds MAX_STDIN_BYTES
  */
 async function readStdin(): Promise<string | undefined> {
-	if (process.stdin.isTTY) return undefined;
+	if (process.stdin.isTTY) {
+		const noStdin = undefined;
+		return noStdin;
+	}
 
 	return new Promise((resolve, reject) => {
 		const chunks: Buffer[] = [];

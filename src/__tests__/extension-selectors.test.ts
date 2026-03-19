@@ -3,13 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createMockModel } from "../../test-utils/mock-model.js";
-import { BUNDLED } from "../config.js";
+import { BUNDLED } from "../app-config.js";
 import {
 	createTallowSession,
 	getBundledExtensionCatalog,
 	resolveExtensionSelector,
 	resolveExtensionSelectors,
-} from "../sdk.js";
+} from "../sdk-client.js";
 
 const tempDirs: string[] = [];
 

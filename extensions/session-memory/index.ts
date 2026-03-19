@@ -39,7 +39,7 @@ let indexer: SessionIndexer | null = null;
 /**
  * Resolve the tallow config directory.
  *
- * TALLOW_CODING_AGENT_DIR is set by tallow's bootstrap (src/config.ts) before
+ * TALLOW_CODING_AGENT_DIR is set by tallow's bootstrap (src/app-config.ts) before
  * any extensions load. It accounts for per-project overrides from
  * ~/.config/tallow-work-dirs. All extensions should use this — never hardcode ~/.tallow.
  *

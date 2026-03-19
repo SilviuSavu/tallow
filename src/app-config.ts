@@ -151,9 +151,9 @@ export function sanitizePath(path: string): string {
  * Env vars must be set at module scope — NOT inside a function.
  *
  * ESM hoists all `import` statements: every imported module is evaluated
- * before the importing module's body runs.  In cli.ts the layout is:
+ * before the importing module's body runs.  In cli-main.ts the layout is:
  *
- *   import { bootstrap } from "./config.js";   // ① evaluated first
+ *   import { bootstrap } from "./app-config.js";   // ① evaluated first
  *   bootstrap();                                // ③ runs AFTER all imports
  *   import { … } from "pi-coding-agent";       // ② evaluated second
  *

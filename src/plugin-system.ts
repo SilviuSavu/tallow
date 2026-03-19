@@ -29,7 +29,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, posix, relative, resolve } from "node:path";
-import { TALLOW_HOME } from "./config.js";
+import { TALLOW_HOME } from "./app-config.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -285,7 +285,8 @@ export function normalizePluginRef(
 	specForError = "plugin spec"
 ): string | undefined {
 	if (ref == null) {
-		return undefined;
+		const noRef = undefined;
+		return noRef;
 	}
 
 	const trimmed = ref.trim();
@@ -553,7 +554,10 @@ const SEMVER_PATTERN = /^v?\d+\.\d+\.\d+(?:-[\w.]+)?$/;
  * @returns True if the ref appears to be a semver tag
  */
 export function isImmutableRef(ref: string | undefined): boolean {
-	if (!ref) return false;
+	if (!ref) {
+		const noRef = false;
+		return noRef;
+	}
 	return SEMVER_PATTERN.test(ref);
 }
 
@@ -598,19 +602,26 @@ export function getCachePath(spec: PluginSpec | NormalizedRemotePluginSpec): str
  */
 export function isCacheValid(cachePath: string, _spec: PluginSpec): boolean {
 	const metaPath = join(cachePath, CACHE_META_FILE);
-	if (!existsSync(metaPath)) return false;
+	if (!existsSync(metaPath)) {
+		const noMeta = false;
+		return noMeta;
+	}
 
 	try {
 		const meta: CacheMeta = JSON.parse(readFileSync(metaPath, "utf-8"));
 
 		// Immutable (semver) — valid forever
-		if (meta.immutable) return true;
+		if (meta.immutable) {
+			const immutableValid = true;
+			return immutableValid;
+		}
 
 		// Mutable — check TTL
 		const cachedAt = new Date(meta.cachedAt).getTime();
 		return Date.now() - cachedAt < MUTABLE_CACHE_TTL_MS;
 	} catch {
-		return false;
+		const parseFailed = false;
+		return parseFailed;
 	}
 }
 
@@ -758,7 +769,10 @@ function isJsonRecord(value: unknown): value is JsonRecord {
  * @returns Normalized string array or undefined
  */
 function parseStringArray(value: unknown): readonly string[] | undefined {
-	if (!Array.isArray(value)) return undefined;
+	if (!Array.isArray(value)) {
+		const notArray = undefined;
+		return notArray;
+	}
 
 	const parsed = value
 		.filter((item): item is string => typeof item === "string")
@@ -775,7 +789,10 @@ function parseStringArray(value: unknown): readonly string[] | undefined {
  * @returns Parsed relationships array or undefined
  */
 function parseRelationships(value: unknown): readonly TallowExtensionRelationship[] | undefined {
-	if (!Array.isArray(value)) return undefined;
+	if (!Array.isArray(value)) {
+		const notArray = undefined;
+		return notArray;
+	}
 
 	const parsed = value
 		.map((item) => {
@@ -783,10 +800,16 @@ function parseRelationships(value: unknown): readonly TallowExtensionRelationshi
 				const name = item.trim();
 				return name ? { name } : null;
 			}
-			if (!isJsonRecord(item) || typeof item.name !== "string") return null;
+			if (!isJsonRecord(item) || typeof item.name !== "string") {
+				const invalidItem = null;
+				return invalidItem;
+			}
 
 			const name = item.name.trim();
-			if (!name) return null;
+			if (!name) {
+				const emptyName = null;
+				return emptyName;
+			}
 
 			const kind = typeof item.kind === "string" ? item.kind : undefined;
 			const reason = typeof item.reason === "string" ? item.reason : undefined;
@@ -814,7 +837,10 @@ function parseCapabilities(root: JsonRecord): TallowExtensionCapabilities | unde
 	const events = parseStringArray(capabilitiesRoot.events);
 	const tools = parseStringArray(capabilitiesRoot.tools);
 
-	if (!commands && !events && !tools) return undefined;
+	if (!commands && !events && !tools) {
+		const noCapabilities = undefined;
+		return noCapabilities;
+	}
 
 	return {
 		commands,
@@ -830,7 +856,10 @@ function parseCapabilities(root: JsonRecord): TallowExtensionCapabilities | unde
  * @returns Parsed permission surface object or undefined
  */
 function parsePermissionSurface(value: unknown): TallowExtensionPermissionSurface | undefined {
-	if (!isJsonRecord(value)) return undefined;
+	if (!isJsonRecord(value)) {
+		const notRecord = undefined;
+		return notRecord;
+	}
 
 	const filesystem =
 		value.filesystem === "none" || value.filesystem === "read" || value.filesystem === "write"
@@ -840,13 +869,14 @@ function parsePermissionSurface(value: unknown): TallowExtensionPermissionSurfac
 	const shell = typeof value.shell === "boolean" ? value.shell : undefined;
 	const subprocess = typeof value.subprocess === "boolean" ? value.subprocess : undefined;
 
-	if (
+	const allUndefined =
 		filesystem === undefined &&
 		network === undefined &&
 		shell === undefined &&
-		subprocess === undefined
-	) {
-		return undefined;
+		subprocess === undefined;
+	if (allUndefined) {
+		const noSurface = undefined;
+		return noSurface;
 	}
 
 	return {
@@ -878,7 +908,10 @@ function parseWhenToUse(value: unknown): readonly string[] | undefined {
  * @returns Claude manifest or null when invalid
  */
 function parseClaudePluginManifest(value: unknown): ClaudePluginManifest | null {
-	if (!isJsonRecord(value) || typeof value.name !== "string") return null;
+	if (!isJsonRecord(value) || typeof value.name !== "string") {
+		const invalidManifest = null;
+		return invalidManifest;
+	}
 
 	return {
 		author: isJsonRecord(value.author)
@@ -900,10 +933,16 @@ function parseClaudePluginManifest(value: unknown): ClaudePluginManifest | null 
  * @returns Tallow extension manifest or null when invalid
  */
 function parseTallowExtensionManifest(value: unknown): TallowExtensionManifest | null {
-	if (!isJsonRecord(value) || typeof value.name !== "string") return null;
+	if (!isJsonRecord(value) || typeof value.name !== "string") {
+		const invalidManifest = null;
+		return invalidManifest;
+	}
 
 	const name = value.name.trim();
-	if (!name) return null;
+	if (!name) {
+		const emptyName = null;
+		return emptyName;
+	}
 
 	return {
 		capabilities: parseCapabilities(value),
@@ -940,11 +979,14 @@ export function readPluginManifest(
 				const content = readFileSync(join(pluginPath, "extension.json"), "utf-8");
 				return parseTallowExtensionManifest(JSON.parse(content));
 			}
-			default:
-				return null;
+			default: {
+				const unknownFormat = null;
+				return unknownFormat;
+			}
 		}
 	} catch {
-		return null;
+		const readFailed = null;
+		return readFailed;
 	}
 }
 
@@ -1137,7 +1179,10 @@ export function listCachedPlugins(): Array<{
 	path: string;
 	meta: CacheMeta | null;
 }> {
-	if (!existsSync(CACHE_DIR)) return [];
+	if (!existsSync(CACHE_DIR)) {
+		const noCacheDir: Array<{ name: string; path: string; meta: CacheMeta | null }> = [];
+		return noCacheDir;
+	}
 
 	const entries: Array<{ name: string; path: string; meta: CacheMeta | null }> = [];
 

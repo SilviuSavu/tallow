@@ -40,7 +40,7 @@ export {
 	setRuntimePathProviderForTests,
 	TALLOW_HOME,
 	TALLOW_VERSION,
-} from "./config.js";
+} from "./app-config.js";
 export {
 	type ClaudePluginManifest,
 	type ClaudePluginResources,
@@ -60,7 +60,7 @@ export {
 	type TallowExtensionManifest,
 	type TallowExtensionPermissionSurface,
 	type TallowExtensionRelationship,
-} from "./plugins.js";
+} from "./plugin-system.js";
 export {
 	createRuntimePathProvider,
 	createStaticRuntimePathProvider,
@@ -77,7 +77,7 @@ export {
 	resolveExtensionSelectors,
 	type TallowSession,
 	type TallowSessionOptions,
-} from "./sdk.js";
+} from "./sdk-client.js";
 export { createSessionWithId, findSessionById } from "./session-utils.js";
 
 // ── Re-exports from pi (convenience) ─────────────────────────────────────────

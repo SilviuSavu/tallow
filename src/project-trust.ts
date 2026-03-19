@@ -3,7 +3,7 @@ import type { Dirent } from "node:fs";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { atomicWriteFileSync } from "./atomic-write.js";
-import { PROJECT_TRUST_STORE_PATH, TRUST_DIR } from "./config.js";
+import { PROJECT_TRUST_STORE_PATH, TRUST_DIR } from "./app-config.js";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -86,12 +86,18 @@ function getTrustStoreDir(): string {
  */
 function loadTrustStore(): ProjectTrustStore {
 	const storePath = getTrustStorePath();
-	if (!existsSync(storePath)) return {};
+	if (!existsSync(storePath)) {
+		const noStore: ProjectTrustStore = {};
+		return noStore;
+	}
 
 	try {
 		const raw = readFileSync(storePath, "utf-8");
 		const parsed = JSON.parse(raw) as Record<string, unknown>;
-		if (!parsed || typeof parsed !== "object") return {};
+		if (!parsed || typeof parsed !== "object") {
+			const invalidStore: ProjectTrustStore = {};
+			return invalidStore;
+		}
 
 		const store: ProjectTrustStore = {};
 		for (const [key, value] of Object.entries(parsed)) {
@@ -102,8 +108,9 @@ function loadTrustStore(): ProjectTrustStore {
 		}
 		return store;
 	} catch {
-		// Corrupt trust metadata → behave as if no projects are trusted.
-		return {};
+		// Corrupt trust metadata — behave as if no projects are trusted.
+		const emptyStore: ProjectTrustStore = {};
+		return emptyStore;
 	}
 }
 

@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { AgentSessionEvent, ExtensionFactory } from "@mariozechner/pi-coding-agent";
-import { createTallowSession, type TallowSession } from "../src/sdk.js";
+import { createTallowSession, type TallowSession } from "../src/sdk-client.js";
 import { createEchoStreamFn, createMockModel } from "./mock-model.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────

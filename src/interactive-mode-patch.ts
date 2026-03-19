@@ -56,7 +56,10 @@ function hasLeadingIcon(message: string): boolean {
  * @returns True when either steering or follow-up queue is non-empty
  */
 function hasQueuedMessages(messages: QueuedMessagesLike | undefined): boolean {
-	if (!messages) return false;
+	if (!messages) {
+		const noMessages = false;
+		return noMessages;
+	}
 	const steeringCount = Array.isArray(messages.steering) ? messages.steering.length : 0;
 	const followUpCount = Array.isArray(messages.followUp) ? messages.followUp.length : 0;
 	return steeringCount > 0 || followUpCount > 0;

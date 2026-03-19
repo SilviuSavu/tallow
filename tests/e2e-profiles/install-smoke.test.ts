@@ -10,11 +10,11 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { createTallowSession } from "../../src/sdk.js";
+import { createTallowSession } from "../../src/sdk-client.js";
 import { createEchoStreamFn, createMockModel } from "../../test-utils/mock-model.js";
 
 const PROJECT_ROOT = resolve(import.meta.dirname, "../..");
-const INSTALL_SCRIPT = join(PROJECT_ROOT, "dist/install.js");
+const INSTALL_SCRIPT = join(PROJECT_ROOT, "dist/install-flow.js");
 
 let tmpHome: string | undefined;
 

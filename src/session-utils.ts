@@ -11,7 +11,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { type SessionHeader, SessionManager } from "@mariozechner/pi-coding-agent";
 import { atomicWriteFileSync } from "./atomic-write.js";
-import { TALLOW_HOME } from "./config.js";
+import { TALLOW_HOME } from "./app-config.js";
 import { encodeSessionDirName } from "./session-migration.js";
 
 /** Current session file format version (mirrors pi's CURRENT_SESSION_VERSION) */
@@ -77,13 +77,17 @@ function sessionDirForCwd(cwd: string): string {
  */
 export function findSessionById(sessionId: string, cwd: string): string | null {
 	const sessionsDir = sessionDirForCwd(cwd);
-	if (!existsSync(sessionsDir)) return null;
+	if (!existsSync(sessionsDir)) {
+		const noDir = null;
+		return noDir;
+	}
 
 	let files: string[];
 	try {
 		files = readdirSync(sessionsDir).filter((f) => f.endsWith(".jsonl"));
 	} catch {
-		return null;
+		const readFailed = null;
+		return readFailed;
 	}
 
 	// Fast path: match by filename suffix convention (<timestamp>_<id>.jsonl)
@@ -106,7 +110,8 @@ export function findSessionById(sessionId: string, cwd: string): string | null {
 		}
 	}
 
-	return null;
+	const notFound = null;
+	return notFound;
 }
 
 /**

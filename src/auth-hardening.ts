@@ -251,7 +251,10 @@ export function resolveRuntimeApiKeyFromEnv(): string | undefined {
 		throw new Error("Set either TALLOW_API_KEY or TALLOW_API_KEY_REF, not both.");
 	}
 	if (runtimeKey) return runtimeKey;
-	if (!runtimeRef) return undefined;
+	if (!runtimeRef) {
+		const noRef = undefined;
+		return noRef;
+	}
 	return resolveReferenceValue(runtimeRef);
 }
 
@@ -299,13 +302,17 @@ function normalizeApiKeyValue(
  * @returns Parsed auth data or empty object
  */
 function readAuthData(authPath: string): Record<string, AuthCredential> {
-	if (!existsSync(authPath)) return {};
+	if (!existsSync(authPath)) {
+		const noFile: Record<string, AuthCredential> = {};
+		return noFile;
+	}
 	try {
 		const parsed = JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, AuthCredential>;
 		if (parsed && typeof parsed === "object") {
 			return parsed;
 		}
-		return {};
+		const invalidData: Record<string, AuthCredential> = {};
+		return invalidData;
 	} catch {
 		// Primary file is corrupt — attempt backup recovery
 		const restored = restoreFromBackup(authPath, (content) => {
@@ -316,10 +323,12 @@ function readAuthData(authPath: string): Record<string, AuthCredential> {
 			try {
 				return JSON.parse(readFileSync(authPath, "utf-8")) as Record<string, AuthCredential>;
 			} catch {
-				return {};
-			}
+			const recoveryFailed: Record<string, AuthCredential> = {};
+			return recoveryFailed;
 		}
-		return {};
+		}
+		const corruptFallback: Record<string, AuthCredential> = {};
+		return corruptFallback;
 	}
 }
 

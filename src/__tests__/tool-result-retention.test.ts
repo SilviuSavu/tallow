@@ -3,7 +3,7 @@ import {
 	applyToolResultRetentionToMessages,
 	resolveToolResultRetentionPolicy,
 	TOOL_RESULT_RETENTION_MARKER,
-} from "../sdk.js";
+} from "../sdk-client.js";
 
 /**
  * Build a toolResult-like message with deterministic payload size.

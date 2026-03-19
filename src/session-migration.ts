@@ -35,13 +35,19 @@ export function encodeSessionDirName(cwd: string): string {
  * @returns Number of files migrated
  */
 export function migrateSessionsToPerCwdDirs(sessionsDir: string): number {
-	if (!existsSync(sessionsDir)) return 0;
+	if (!existsSync(sessionsDir)) {
+		const noMigrations = 0;
+		return noMigrations;
+	}
 
 	const flatFiles = readdirSync(sessionsDir).filter(
 		(f) => f.endsWith(".jsonl") && statSync(join(sessionsDir, f)).isFile()
 	);
 
-	if (flatFiles.length === 0) return 0;
+	if (flatFiles.length === 0) {
+		const noFiles = 0;
+		return noFiles;
+	}
 
 	let migrated = 0;
 

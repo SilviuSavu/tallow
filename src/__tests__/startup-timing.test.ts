@@ -23,7 +23,8 @@ beforeEach(() => {
 	originalStderrWrite = process.stderr.write;
 	process.stderr.write = ((chunk: string | Uint8Array): boolean => {
 		stderrWrites.push(typeof chunk === "string" ? chunk : new TextDecoder().decode(chunk));
-		return true;
+		const written = true;
+		return written;
 	}) as typeof process.stderr.write;
 });
 

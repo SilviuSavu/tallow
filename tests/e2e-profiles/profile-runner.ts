@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { AgentSessionEvent } from "@mariozechner/pi-coding-agent";
-import { createTallowSession, type TallowSession } from "../../src/sdk.js";
+import { createTallowSession, type TallowSession } from "../../src/sdk-client.js";
 import type { ScriptedResponse } from "../../test-utils/mock-model.js";
 import {
 	createEchoStreamFn,

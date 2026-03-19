@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { createTallowSession, type TallowSession } from "../../src/sdk.js";
+import { createTallowSession, type TallowSession } from "../../src/sdk-client.js";
 import { createMockModel, createScriptedStreamFn } from "../../test-utils/mock-model.js";
 import { resolveExtensionPaths, STANDARD_EXTENSIONS } from "./profiles.js";
 

@@ -11,7 +11,7 @@
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { TALLOW_HOME } from "./config.js";
+import { TALLOW_HOME } from "./app-config.js";
 
 /** Persistent crash log — always written, independent of debug mode. */
 const CRASH_LOG = join(TALLOW_HOME, "crash.log");

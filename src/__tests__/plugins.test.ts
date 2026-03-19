@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { PluginSpec } from "../plugins.js";
+import type { PluginSpec } from "../plugin-system.js";
 import {
 	buildPluginCacheKey,
 	detectPluginFormat,
@@ -18,7 +18,7 @@ import {
 	resolveContainedSubpath,
 	resolvePlugin,
 	resolvePlugins,
-} from "../plugins.js";
+} from "../plugin-system.js";
 
 // ─── parsePluginSpec ─────────────────────────────────────────────────────────
 

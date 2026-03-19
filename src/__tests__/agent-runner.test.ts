@@ -6,7 +6,7 @@ describe("agent runner resolution", () => {
 		const candidates = resolveAgentRunnerCandidates({
 			env: { TALLOW_HOOK_AGENT_RUNNER: "custom-runner" },
 			execPath: "/usr/local/bin/node",
-			argv: ["node", "/work/tallow/dist/cli.js"],
+			argv: ["node", "/work/tallow/dist/cli-main.js"],
 			overrideEnvVar: "TALLOW_HOOK_AGENT_RUNNER",
 		});
 
@@ -16,7 +16,7 @@ describe("agent runner resolution", () => {
 			"tallow",
 			"pi",
 		]);
-		expect(candidates[1]?.preArgs).toEqual(["/work/tallow/dist/cli.js"]);
+		expect(candidates[1]?.preArgs).toEqual(["/work/tallow/dist/cli-main.js"]);
 	});
 
 	test("deduplicates candidates while preserving first occurrence", () => {

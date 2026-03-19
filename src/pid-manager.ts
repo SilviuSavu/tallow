@@ -19,7 +19,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
-import { getRuntimePathProvider } from "./config.js";
+import { getRuntimePathProvider } from "./app-config.js";
 import type { RuntimePathProvider } from "./runtime-path-provider.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -95,21 +95,31 @@ function getSessionPidDirPath(): string {
  * @returns True when the value is a supported PID entry
  */
 function isPidEntry(value: unknown): value is PidEntry {
-	if (!value || typeof value !== "object") return false;
+	const invalid = false;
+	if (!value || typeof value !== "object") {
+		return invalid;
+	}
 	const candidate = value as Record<string, unknown>;
-	if (typeof candidate.pid !== "number") return false;
-	if (typeof candidate.command !== "string") return false;
-	if (typeof candidate.startedAt !== "number") return false;
+	if (typeof candidate.pid !== "number") {
+		return invalid;
+	}
+	if (typeof candidate.command !== "string") {
+		return invalid;
+	}
+	if (typeof candidate.startedAt !== "number") {
+		return invalid;
+	}
 	if (candidate.ownerPid != null && typeof candidate.ownerPid !== "number") {
-		return false;
+		return invalid;
 	}
 	if (candidate.ownerStartedAt != null && typeof candidate.ownerStartedAt !== "string") {
-		return false;
+		return invalid;
 	}
 	if (candidate.processStartedAt != null && typeof candidate.processStartedAt !== "string") {
-		return false;
+		return invalid;
 	}
-	return true;
+	const valid = true;
+	return valid;
 }
 
 /**
@@ -119,13 +129,19 @@ function isPidEntry(value: unknown): value is PidEntry {
  * @returns True when the value is a valid session owner
  */
 function isSessionOwner(value: unknown): value is SessionOwner {
-	if (!value || typeof value !== "object") return false;
-	const candidate = value as Record<string, unknown>;
-	if (typeof candidate.pid !== "number") return false;
-	if (candidate.startedAt != null && typeof candidate.startedAt !== "string") {
-		return false;
+	const invalid = false;
+	if (!value || typeof value !== "object") {
+		return invalid;
 	}
-	return true;
+	const candidate = value as Record<string, unknown>;
+	if (typeof candidate.pid !== "number") {
+		return invalid;
+	}
+	if (candidate.startedAt != null && typeof candidate.startedAt !== "string") {
+		return invalid;
+	}
+	const valid = true;
+	return valid;
 }
 
 /**
@@ -135,10 +151,17 @@ function isSessionOwner(value: unknown): value is SessionOwner {
  * @returns Normalized legacy PID file, or null when invalid
  */
 function normalizeLegacyPidFile(value: unknown): LegacyPidFile | null {
-	if (!value || typeof value !== "object") return null;
+	const notValid = null;
+	if (!value || typeof value !== "object") {
+		return notValid;
+	}
 	const candidate = value as Record<string, unknown>;
-	if (candidate.version !== 1) return null;
-	if (!Array.isArray(candidate.entries)) return null;
+	if (candidate.version !== 1) {
+		return notValid;
+	}
+	if (!Array.isArray(candidate.entries)) {
+		return notValid;
+	}
 	return {
 		version: 1,
 		entries: candidate.entries.filter(isPidEntry),
@@ -152,11 +175,20 @@ function normalizeLegacyPidFile(value: unknown): LegacyPidFile | null {
  * @returns Normalized session PID file, or null when invalid
  */
 function normalizeSessionPidFile(value: unknown): SessionPidFile | null {
-	if (!value || typeof value !== "object") return null;
+	const notValid = null;
+	if (!value || typeof value !== "object") {
+		return notValid;
+	}
 	const candidate = value as Record<string, unknown>;
-	if (candidate.version !== 2) return null;
-	if (!isSessionOwner(candidate.owner)) return null;
-	if (!Array.isArray(candidate.entries)) return null;
+	if (candidate.version !== 2) {
+		return notValid;
+	}
+	if (!isSessionOwner(candidate.owner)) {
+		return notValid;
+	}
+	if (!Array.isArray(candidate.entries)) {
+		return notValid;
+	}
 	return {
 		version: 2,
 		owner: candidate.owner,
@@ -213,7 +245,8 @@ function readLegacyPidFile(): LegacyPidFile | null {
 		const raw = readFileSync(getLegacyPidFilePath(), "utf-8");
 		return normalizeLegacyPidFile(JSON.parse(raw) as unknown);
 	} catch {
-		return null;
+		const readFailed = null;
+		return readFailed;
 	}
 }
 
@@ -228,7 +261,8 @@ function readSessionPidFile(filePath: string): SessionPidFile | null {
 		const raw = readFileSync(filePath, "utf-8");
 		return normalizeSessionPidFile(JSON.parse(raw) as unknown);
 	} catch {
-		return null;
+		const readFailed = null;
+		return readFailed;
 	}
 }
 
@@ -269,7 +303,8 @@ function removeFile(filePath: string): void {
 function listSessionPidFiles(): string[] {
 	const sessionPidDir = getSessionPidDirPath();
 	if (!existsSync(sessionPidDir)) {
-		return [];
+		const noPidFiles: string[] = [];
+		return noPidFiles;
 	}
 
 	try {
@@ -277,7 +312,8 @@ function listSessionPidFiles(): string[] {
 			.filter((entry) => entry.endsWith(".json") && !entry.startsWith("."))
 			.map((entry) => join(sessionPidDir, entry));
 	} catch {
-		return [];
+		const readFailed: string[] = [];
+		return readFailed;
 	}
 }
 
@@ -356,9 +392,11 @@ function migrateLegacyPidFile(): void {
 function isProcessAlive(pid: number): boolean {
 	try {
 		process.kill(pid, 0);
-		return true;
+		const alive = true;
+		return alive;
 	} catch {
-		return false;
+		const notAlive = false;
+		return notAlive;
 	}
 }
 
@@ -374,10 +412,15 @@ function readProcessStartedAt(pid: number): string | null {
 		stdio: ["ignore", "pipe", "ignore"],
 	});
 	if (result.error || result.status !== 0) {
-		return null;
+		const unavailable = null;
+		return unavailable;
 	}
 	const startedAt = result.stdout.trim();
-	return startedAt.length > 0 ? startedAt : null;
+	if (startedAt.length === 0) {
+		const noOutput = null;
+		return noOutput;
+	}
+	return startedAt;
 }
 
 /**
@@ -388,11 +431,13 @@ function readProcessStartedAt(pid: number): string | null {
  */
 function hasMatchingProcessIdentity(entry: PidEntry): boolean {
 	if (!entry.processStartedAt) {
-		return false;
+		const noIdentity = false;
+		return noIdentity;
 	}
 	const currentStartedAt = readProcessStartedAt(entry.pid);
 	if (!currentStartedAt) {
-		return false;
+		const unreadable = false;
+		return unreadable;
 	}
 	return currentStartedAt === entry.processStartedAt;
 }
@@ -404,15 +449,16 @@ function hasMatchingProcessIdentity(entry: PidEntry): boolean {
  * @returns True when owner process is still active and unchanged
  */
 function hasMatchingSessionOwner(owner: SessionOwner): boolean {
+	const noMatch = false;
 	if (!hasOwnerIdentity(owner)) {
-		return false;
+		return noMatch;
 	}
 	if (!isProcessAlive(owner.pid)) {
-		return false;
+		return noMatch;
 	}
 	const currentOwnerStartedAt = readProcessStartedAt(owner.pid);
 	if (!currentOwnerStartedAt) {
-		return false;
+		return noMatch;
 	}
 	return currentOwnerStartedAt === owner.startedAt;
 }

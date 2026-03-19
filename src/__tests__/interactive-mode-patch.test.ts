@@ -85,7 +85,8 @@ class FakeInteractiveMode {
 	 */
 	restoreQueuedMessagesToEditor(options?: { abort?: boolean }): boolean {
 		this.lastRestoredAbort = options?.abort;
-		return true;
+		const restored = true;
+		return restored;
 	}
 
 	/**
