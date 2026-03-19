@@ -5,6 +5,10 @@ import weztermPaneControl, {
 	buildWeztermPaneGuidance,
 	executeWeztermAction,
 	filterPanesToCurrentTab,
+	hasExplicitPaneRequest,
+	hasSensitiveOutputMention,
+	isPaneCreatingAction,
+	unescapeText,
 	type WeztermCliResult,
 	type WeztermPaneInfo,
 } from "../index.js";
@@ -91,14 +95,44 @@ describe("wezterm-pane-control registration", () => {
 });
 
 describe("buildWeztermPaneGuidance", () => {
-	it("includes privacy and manual-monitoring guidance", () => {
+	it("includes bg_bash-first default, pane exceptions, sending, and privacy guidance", () => {
 		const guidance = buildWeztermPaneGuidance(116);
-		expect(guidance).toContain("Do not run or read commands likely to reveal private secrets");
-		expect(guidance).toContain("Default behavior: if you prefill a command");
-		expect(guidance).toContain("Only leave a command unexecuted");
-		expect(guidance).toContain("user wants to monitor output themselves");
-		expect(guidance).toContain("newline (\\n) via send_text");
 		expect(guidance).toContain("WezTerm pane 116");
+		// bg_bash-first default
+		expect(guidance).toContain("use bg_bash");
+		expect(guidance).toContain("bg_bash");
+		// Pane exceptions — exactly 2
+		expect(guidance).toContain("User explicitly requests it");
+		expect(guidance).toContain("Sensitive output");
+		// Anti-speculative clause
+		expect(guidance).toContain("Never open a pane speculatively");
+		// bg_bash handles everything
+		expect(guidance).toContain(
+			"bg_bash\nhandles dev servers, builds, watchers, TUI apps, progress bars"
+		);
+		// Sending commands
+		expect(guidance).toContain("appending \\n");
+		// Privacy
+		expect(guidance).toContain("Do NOT call read_text on that pane");
+		expect(guidance).toContain("LLM must not consume secrets");
+	});
+
+	it("lists exactly 2 numbered exceptions", () => {
+		const guidance = buildWeztermPaneGuidance(116);
+		const numberedLines = guidance.split("\n").filter((l) => /^\d+\.\s/.test(l));
+		expect(numberedLines.length).toBe(2);
+	});
+
+	it("does not contain removed over-permissive guidance", () => {
+		const guidance = buildWeztermPaneGuidance(116);
+		expect(guidance).not.toContain("Long-running process the user wants to visually monitor");
+		expect(guidance).not.toContain("Process that needs a proper shell environment");
+		expect(guidance).not.toContain("ask_user_question");
+		expect(guidance).not.toContain("just create the pane and run it");
+		// Removed TTY exception
+		expect(guidance).not.toContain("Interactive TTY required");
+		expect(guidance).not.toContain("curses/TUI interface");
+		expect(guidance).not.toContain("progress bars that require a real terminal");
 	});
 });
 
@@ -280,5 +314,151 @@ describe("executeWeztermAction", () => {
 
 		expect(result.isError).toBe(true);
 		expect(result.content[0].text).toContain("pane not found");
+	});
+
+	it("send_text unescapes \\n and uses --no-paste", () => {
+		let capturedArgs: readonly string[] = [];
+		const result = executeWeztermAction(
+			{ action: "send_text", text: "pnpm dev\\n" },
+			{
+				currentPaneId: 18,
+				runCli: (args) => {
+					capturedArgs = args;
+					return cli("");
+				},
+			}
+		);
+
+		expect(result.isError).toBeUndefined();
+		expect(capturedArgs).toEqual(["send-text", "--no-paste", "--pane-id", "18", "pnpm dev\n"]);
+	});
+
+	it("send_text unescapes hex escapes like \\x03 (Ctrl-C)", () => {
+		let capturedArgs: readonly string[] = [];
+		executeWeztermAction(
+			{ action: "send_text", text: "\\x03" },
+			{
+				currentPaneId: 18,
+				runCli: (args) => {
+					capturedArgs = args;
+					return cli("");
+				},
+			}
+		);
+
+		expect(capturedArgs).toEqual(["send-text", "--no-paste", "--pane-id", "18", "\x03"]);
+	});
+
+	it("send_text preserves literal backslashes via \\\\", () => {
+		let capturedArgs: readonly string[] = [];
+		executeWeztermAction(
+			{ action: "send_text", text: "echo \\\\n" },
+			{
+				currentPaneId: 18,
+				runCli: (args) => {
+					capturedArgs = args;
+					return cli("");
+				},
+			}
+		);
+
+		// \\n → literal backslash followed by 'n' (not a newline)
+		expect(capturedArgs[4]).toBe("echo \\n");
+	});
+});
+
+describe("unescapeText", () => {
+	it("converts \\n to newline", () => {
+		expect(unescapeText("hello\\n")).toBe("hello\n");
+	});
+
+	it("converts \\t to tab", () => {
+		expect(unescapeText("col1\\tcol2")).toBe("col1\tcol2");
+	});
+
+	it("converts \\r to carriage return", () => {
+		expect(unescapeText("line\\r")).toBe("line\r");
+	});
+
+	it("converts \\xNN hex escapes", () => {
+		expect(unescapeText("\\x03")).toBe("\x03");
+		expect(unescapeText("\\x1b")).toBe("\x1b");
+		expect(unescapeText("\\x41")).toBe("A");
+	});
+
+	it("converts \\\\\\\\ to literal backslash", () => {
+		expect(unescapeText("\\\\")).toBe("\\");
+	});
+
+	it("preserves \\\\ before escape chars: \\\\n → literal backslash + n", () => {
+		expect(unescapeText("\\\\n")).toBe("\\n");
+	});
+
+	it("leaves unrecognized sequences untouched", () => {
+		expect(unescapeText("hello\\z world")).toBe("hello\\z world");
+	});
+
+	it("handles multiple escapes in one string", () => {
+		expect(unescapeText("cd /tmp\\n\\nls -la\\n")).toBe("cd /tmp\n\nls -la\n");
+	});
+
+	it("returns empty string unchanged", () => {
+		expect(unescapeText("")).toBe("");
+	});
+
+	it("returns plain text unchanged", () => {
+		expect(unescapeText("no escapes here")).toBe("no escapes here");
+	});
+});
+
+describe("isPaneCreatingAction", () => {
+	it("returns true for pane-creating actions", () => {
+		expect(isPaneCreatingAction("split")).toBe(true);
+		expect(isPaneCreatingAction("spawn_tab")).toBe(true);
+		expect(isPaneCreatingAction("move_to_tab")).toBe(true);
+	});
+
+	it("returns false for non-creating actions", () => {
+		expect(isPaneCreatingAction("list")).toBe(false);
+		expect(isPaneCreatingAction("read_text")).toBe(false);
+		expect(isPaneCreatingAction("send_text")).toBe(false);
+		expect(isPaneCreatingAction("close")).toBe(false);
+		expect(isPaneCreatingAction("focus")).toBe(false);
+		expect(isPaneCreatingAction("zoom")).toBe(false);
+		expect(isPaneCreatingAction("resize")).toBe(false);
+	});
+});
+
+describe("hasExplicitPaneRequest", () => {
+	it("returns true for explicit pane/tab requests", () => {
+		expect(hasExplicitPaneRequest("open a pane for the server")).toBe(true);
+		expect(hasExplicitPaneRequest("new tab please")).toBe(true);
+		expect(hasExplicitPaneRequest("split the terminal")).toBe(true);
+		expect(hasExplicitPaneRequest("use wezterm to show logs")).toBe(true);
+		expect(hasExplicitPaneRequest("spawn a tab for this")).toBe(true);
+	});
+
+	it("returns false for non-pane prompts", () => {
+		expect(hasExplicitPaneRequest("start the dev server")).toBe(false);
+		expect(hasExplicitPaneRequest("run the build")).toBe(false);
+		expect(hasExplicitPaneRequest("left align the text")).toBe(false);
+		expect(hasExplicitPaneRequest("watch for file changes")).toBe(false);
+		expect(hasExplicitPaneRequest("open the browser")).toBe(false);
+	});
+});
+
+describe("hasSensitiveOutputMention", () => {
+	it("returns true for sensitive output mentions", () => {
+		expect(hasSensitiveOutputMention("show me the api key")).toBe(true);
+		expect(hasSensitiveOutputMention("generate a token")).toBe(true);
+		expect(hasSensitiveOutputMention("display the password")).toBe(true);
+		expect(hasSensitiveOutputMention("fetch my credentials")).toBe(true);
+		expect(hasSensitiveOutputMention("read the secret from 1password")).toBe(true);
+	});
+
+	it("returns false for non-sensitive prompts", () => {
+		expect(hasSensitiveOutputMention("start the dev server")).toBe(false);
+		expect(hasSensitiveOutputMention("run the tests")).toBe(false);
+		expect(hasSensitiveOutputMention("build the project")).toBe(false);
 	});
 });

@@ -1,91 +1,1110 @@
 /**
- * WebFetch Extension for Pi
+ * WebFetch Extension for Pi.
  *
- * Fetches web content via plain HTTP. Returns page text truncated to 50KB.
- * For JS-rendered pages, full-page scraping, or structured extraction,
- * use a dedicated scraping tool (e.g. Firecrawl) instead.
+ * Fetches web content via plain HTTP. Returns page text truncated by context-budget caps.
+ * When direct fetches fail on bot walls or JS-only shells, it can fall back to the
+ * published `dendrite-scraper` CLI (direct binary first, then `uvx --from dendrite-scraper`).
+ *
+ * Supports adaptive context-budget caps when a planner extension publishes
+ * envelopes via the shared context-budget interop.
  */
 
+import type { LookupOptions } from "node:dns";
+import { lookup } from "node:dns/promises";
+import { request as httpRequest } from "node:http";
+import { request as httpsRequest } from "node:https";
+import { isIP } from "node:net";
+import { Readable } from "node:stream";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
 import { getIcon } from "../_icons/index.js";
+import {
+	CONTEXT_BUDGET_DEFAULTS,
+	type ContextBudgetEnvelope,
+	subscribeToBudgetApi,
+} from "../_shared/context-budget-interop.js";
 import { renderLines } from "../tool-display/index.js";
 
-const DEFAULT_MAX_BYTES = 50_000;
+/** Strict fallback cap when no planner envelope is available. */
+const DEFAULT_MAX_BYTES = CONTEXT_BUDGET_DEFAULTS.unknownUsageFallbackCapBytes;
+
+/** Policy floor — planner/tool logic should never allocate below this by default. */
+const POLICY_MIN_BYTES = CONTEXT_BUDGET_DEFAULTS.minPerToolBytes;
+
+/** Policy ceiling — never exceed this regardless of envelope. */
+const POLICY_MAX_BYTES = CONTEXT_BUDGET_DEFAULTS.maxPerToolBytes;
+
+/** Package name used by the published dendrite fallback. */
+const DENDRITE_PACKAGE = "dendrite-scraper";
+
+/** CLI name exported by the published dendrite package. */
+const DENDRITE_COMMAND = "dendrite-scraper";
+
+/** Global scrape timeout passed to dendrite-scraper. */
+const DENDRITE_TIMEOUT_SECONDS = 45;
+
+/** Process timeout for spawned fallback commands. */
+const DENDRITE_TIMEOUT_MS = 50_000;
+
+/** Status codes worth retrying through the scraper fallback. */
+const DENDRITE_RETRYABLE_STATUSES = new Set([
+	401, 403, 408, 409, 425, 429, 451, 500, 502, 503, 504,
+]);
+
+/** HTML markers that usually mean direct fetch returned a useless shell. */
+const DENDRITE_HTML_MARKERS = [
+	/enable javascript/i,
+	/javascript required/i,
+	/checking your browser/i,
+	/verify you are human/i,
+	/captcha/i,
+	/cloudflare/i,
+	/access denied/i,
+	/please turn javascript on/i,
+] as const;
+
+/** Extra response bytes retained for fallback detection before canceling the stream. */
+const RESPONSE_SNIFF_BYTES = 64 * 1024;
+
+/** Hostnames that should never be fetched by default. */
+const BLOCKED_HOSTNAMES = new Set(["localhost", "localhost.localdomain"]);
+
+/** User agent sent for direct HTTP fetches. */
+const WEB_FETCH_USER_AGENT =
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+	"(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
+
+/** Maximum number of manual redirect hops allowed for direct fetches. */
+const MAX_REDIRECT_HOPS = 5;
+
+/** Redirect statuses handled manually so every hop can be validated. */
+const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+/** Resolver contract used by URL validation tests. */
+export type HostResolver = (hostname: string) => Promise<readonly string[]>;
+
+/** Result of validating a fetch target URL. */
+export type FetchUrlValidationResult =
+	| { readonly ok: true; readonly resolvedAddresses: readonly string[]; readonly url: URL }
+	| { readonly ok: false; readonly reason: string };
+
+/**
+ * Check whether an IPv4 address is private, loopback, link-local, or otherwise local-only.
+ *
+ * @param address - IPv4 address literal
+ * @returns True when the address should be blocked for outbound fetches
+ */
+export function isBlockedIpv4Address(address: string): boolean {
+	const parts = address.split(".").map((part) => Number(part));
+	if (
+		parts.length !== 4 ||
+		parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)
+	) {
+		return false;
+	}
+
+	const [a, b] = parts as [number, number, number, number];
+	return (
+		a === 0 ||
+		a === 10 ||
+		a === 127 ||
+		(a === 169 && b === 254) ||
+		(a === 172 && b >= 16 && b <= 31) ||
+		(a === 192 && b === 168) ||
+		(a === 100 && b >= 64 && b <= 127) ||
+		(a === 192 && b === 0 && parts[2] === 0) ||
+		(a === 198 && (b === 18 || b === 19)) ||
+		a >= 224
+	);
+}
+
+/**
+ * Check whether an IPv6 address is loopback, unique-local, link-local, or unspecified.
+ *
+ * @param address - IPv6 address literal
+ * @returns True when the address should be blocked for outbound fetches
+ */
+export function isBlockedIpv6Address(address: string): boolean {
+	const normalized = address.toLowerCase();
+	return (
+		normalized === "::" ||
+		normalized === "::1" ||
+		normalized.startsWith("fc") ||
+		normalized.startsWith("fd") ||
+		normalized.startsWith("fe8") ||
+		normalized.startsWith("fe9") ||
+		normalized.startsWith("fea") ||
+		normalized.startsWith("feb")
+	);
+}
+
+/**
+ * Check whether an IP literal should be blocked by default.
+ *
+ * @param address - IPv4 or IPv6 literal
+ * @returns True when the address resolves to a local/private network target
+ */
+export function isBlockedIpAddress(address: string): boolean {
+	const version = isIP(address);
+	if (version === 4) return isBlockedIpv4Address(address);
+	if (version === 6) return isBlockedIpv6Address(address);
+	return false;
+}
+
+/**
+ * Resolve a hostname into IP addresses for SSRF validation.
+ *
+ * @param hostname - Hostname to resolve
+ * @returns All resolved IP literals
+ */
+async function resolveHostAddresses(hostname: string): Promise<readonly string[]> {
+	const results = await lookup(hostname, { all: true, verbatim: true });
+	return results.map((result) => result.address);
+}
+
+/**
+ * Validate a fetch target URL before any network call happens.
+ *
+ * Blocks unsupported schemes, credentialed URLs, localhost, `.local`, and
+ * targets that resolve to private or link-local addresses.
+ *
+ * @param rawUrl - User-provided URL string
+ * @param resolveHost - Optional host resolver for tests
+ * @returns Parsed URL when safe, otherwise a blocking reason
+ */
+export async function validateFetchUrl(
+	rawUrl: string,
+	resolveHost: HostResolver = resolveHostAddresses
+): Promise<FetchUrlValidationResult> {
+	let parsed: URL;
+	try {
+		parsed = new URL(rawUrl);
+	} catch {
+		return { ok: false, reason: "invalid URL" };
+	}
+
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		return { ok: false, reason: `unsupported protocol: ${parsed.protocol}` };
+	}
+
+	if (parsed.username || parsed.password) {
+		return { ok: false, reason: "credentialed URLs are not allowed" };
+	}
+
+	const hostname = parsed.hostname.toLowerCase();
+	if (BLOCKED_HOSTNAMES.has(hostname) || hostname.endsWith(".local")) {
+		return { ok: false, reason: `blocked local hostname: ${hostname}` };
+	}
+
+	if (isBlockedIpAddress(hostname)) {
+		return { ok: false, reason: `blocked private IP address: ${hostname}` };
+	}
+
+	let resolvedAddresses: readonly string[] = [];
+	try {
+		resolvedAddresses = await resolveHost(hostname);
+		const blockedAddress = resolvedAddresses.find((address) => isBlockedIpAddress(address));
+		if (blockedAddress) {
+			return {
+				ok: false,
+				reason: `hostname resolved to blocked private IP address: ${blockedAddress}`,
+			};
+		}
+	} catch {
+		// DNS lookup failures are handled by the request path itself. Only successful lookups
+		// participate in private-network blocking.
+	}
+
+	if (resolvedAddresses.length === 0 && isIP(hostname) !== 0) {
+		resolvedAddresses = [hostname];
+	}
+
+	return { ok: true, resolvedAddresses, url: parsed };
+}
+
+/** One validated redirect hop observed during direct HTTP fetches. */
+interface RedirectHopTelemetry {
+	readonly fromUrl: string;
+	readonly pinnedAddress?: string;
+	readonly status: number;
+	readonly toUrl: string;
+}
+
+/** Response metadata returned by the pinned direct HTTP client. */
+interface DirectHttpResponse {
+	readonly pinnedAddress?: string;
+	readonly response: Response;
+	readonly url: string;
+}
+
+/** Direct HTTP implementation signature used by production and tests. */
+export type DirectHttpRequestImpl = (
+	validation: Extract<FetchUrlValidationResult, { readonly ok: true }>,
+	signal: AbortSignal | undefined
+) => Promise<DirectHttpResponse>;
+
+/** Result of a redirect-aware direct HTTP fetch. */
+type DirectFetchResult =
+	| {
+			readonly ok: true;
+			readonly pinnedAddress?: string;
+			readonly redirectChain: readonly RedirectHopTelemetry[];
+			readonly redirectCount: number;
+			readonly response: Response;
+			readonly url: string;
+	  }
+	| {
+			readonly error: string;
+			readonly ok: false;
+			readonly pinnedAddress?: string;
+			readonly redirectChain: readonly RedirectHopTelemetry[];
+			readonly redirectCount: number;
+			readonly status?: number;
+			readonly url: string;
+	  };
+
+/** Active direct HTTP implementation (overridable in tests). */
+let directHttpRequestImpl: DirectHttpRequestImpl = performPinnedDirectHttpRequest;
+
+/**
+ * Override the low-level direct HTTP implementation for tests.
+ *
+ * @param impl - Replacement implementation, or undefined to restore default
+ * @returns void
+ */
+export function setDirectHttpRequestImplForTests(impl?: DirectHttpRequestImpl): void {
+	directHttpRequestImpl = impl ?? performPinnedDirectHttpRequest;
+}
+
+/**
+ * Pick the IP address that the request should pin to for this hop.
+ *
+ * @param validation - Validated fetch target
+ * @returns Pinned IP literal, or null when DNS resolution should remain system-managed
+ */
+function resolvePinnedAddress(
+	validation: Extract<FetchUrlValidationResult, { readonly ok: true }>
+): string | null {
+	if (isIP(validation.url.hostname) !== 0) {
+		return validation.url.hostname;
+	}
+	return validation.resolvedAddresses[0] ?? null;
+}
+
+/**
+ * Build a DNS lookup override that always returns the validated IP address.
+ *
+ * @param pinnedAddress - Validated IP address to pin the socket to
+ * @returns Lookup override for http/https request options
+ */
+function createPinnedLookup(
+	pinnedAddress: string
+): (
+	hostname: string,
+	options: LookupOptions,
+	callback: (
+		error: Error | null,
+		address: string | Array<{ address: string; family: number }>,
+		family?: number
+	) => void
+) => void {
+	return (_hostname, options, callback) => {
+		const family = isIP(pinnedAddress);
+		if (options.all) {
+			callback(null, [{ address: pinnedAddress, family }]);
+			return;
+		}
+		callback(null, pinnedAddress, family);
+	};
+}
+
+/**
+ * Normalize Node's incoming headers object into a Response-compatible shape.
+ *
+ * @param headers - Incoming response headers from http/https
+ * @returns Headers instance safe to pass into the Fetch Response constructor
+ */
+function toResponseHeaders(headers: Record<string, string | string[] | undefined>): Headers {
+	const normalized = new Headers();
+	for (const [key, value] of Object.entries(headers)) {
+		if (Array.isArray(value)) {
+			for (const item of value) {
+				normalized.append(key, item);
+			}
+			continue;
+		}
+		if (typeof value === "string") {
+			normalized.append(key, value);
+		}
+	}
+	return normalized;
+}
+
+/**
+ * Perform one direct HTTP request while pinning the socket lookup to the
+ * validated IP address for the current hop.
+ *
+ * @param validation - Validated target URL plus resolved IPs
+ * @param signal - Abort signal for the request
+ * @returns Response metadata compatible with downstream processing
+ */
+export async function performPinnedDirectHttpRequest(
+	validation: Extract<FetchUrlValidationResult, { readonly ok: true }>,
+	signal: AbortSignal | undefined
+): Promise<DirectHttpResponse> {
+	const pinnedAddress = resolvePinnedAddress(validation) ?? undefined;
+	const requestFn = validation.url.protocol === "https:" ? httpsRequest : httpRequest;
+
+	return await new Promise<DirectHttpResponse>((resolve, reject) => {
+		const request = requestFn(
+			{
+				headers: {
+					"Accept-Encoding": "identity",
+					"User-Agent": WEB_FETCH_USER_AGENT,
+				},
+				hostname: validation.url.hostname,
+				lookup: pinnedAddress ? createPinnedLookup(pinnedAddress) : undefined,
+				method: "GET",
+				path: `${validation.url.pathname}${validation.url.search}`,
+				port: validation.url.port || undefined,
+				signal,
+			},
+			(incoming) => {
+				resolve({
+					pinnedAddress,
+					response: new Response(Readable.toWeb(incoming) as ReadableStream, {
+						headers: toResponseHeaders(incoming.headers),
+						status: incoming.statusCode ?? 0,
+						statusText: incoming.statusMessage ?? "",
+					}),
+					url: validation.url.toString(),
+				});
+			}
+		);
+
+		request.on("error", reject);
+		request.end();
+	});
+}
+
+/**
+ * Fetch a URL while manually validating every redirect hop.
+ *
+ * Redirects are not auto-followed. Each `Location` target is resolved against
+ * the current URL, re-validated, and then fetched explicitly. This closes the
+ * straightforward redirect-to-localhost/private-network SSRF bypass and pins
+ * each request to the IP address that passed validation.
+ *
+ * @param rawUrl - Initial user-supplied URL
+ * @param signal - Abort signal for the in-flight request
+ * @returns Final response or a structured error/block result
+ */
+async function fetchWithValidatedRedirects(
+	rawUrl: string,
+	signal: AbortSignal | undefined
+): Promise<DirectFetchResult> {
+	let currentUrl = rawUrl;
+	const redirectChain: RedirectHopTelemetry[] = [];
+	let lastPinnedAddress: string | undefined;
+
+	for (let hop = 0; hop <= MAX_REDIRECT_HOPS; hop++) {
+		const validation = await validateFetchUrl(currentUrl);
+		if (!validation.ok) {
+			return {
+				ok: false,
+				error: `Blocked URL: ${validation.reason}`,
+				pinnedAddress: lastPinnedAddress,
+				redirectChain,
+				redirectCount: redirectChain.length,
+				url: currentUrl,
+			};
+		}
+
+		const directResponse = await directHttpRequestImpl(validation, signal);
+		const { response } = directResponse;
+		lastPinnedAddress = directResponse.pinnedAddress;
+
+		if (!REDIRECT_STATUSES.has(response.status)) {
+			return {
+				ok: true,
+				pinnedAddress: directResponse.pinnedAddress,
+				redirectChain,
+				redirectCount: redirectChain.length,
+				response,
+				url: directResponse.url,
+			};
+		}
+
+		if (hop === MAX_REDIRECT_HOPS) {
+			return {
+				ok: false,
+				error: `Too many redirects (>${MAX_REDIRECT_HOPS})`,
+				pinnedAddress: directResponse.pinnedAddress,
+				redirectChain,
+				redirectCount: redirectChain.length,
+				status: response.status,
+				url: directResponse.url,
+			};
+		}
+
+		const location = response.headers.get("location");
+		if (!location) {
+			return {
+				ok: false,
+				error: `Redirect response missing location header (HTTP ${response.status})`,
+				pinnedAddress: directResponse.pinnedAddress,
+				redirectChain,
+				redirectCount: redirectChain.length,
+				status: response.status,
+				url: directResponse.url,
+			};
+		}
+
+		const nextUrl = new URL(location, validation.url);
+		redirectChain.push({
+			fromUrl: directResponse.url,
+			pinnedAddress: directResponse.pinnedAddress,
+			status: response.status,
+			toUrl: nextUrl.toString(),
+		});
+		const nextValidation = await validateFetchUrl(nextUrl.toString());
+		if (!nextValidation.ok) {
+			return {
+				ok: false,
+				error: `Blocked redirect target: ${nextValidation.reason}`,
+				pinnedAddress: directResponse.pinnedAddress,
+				redirectChain,
+				redirectCount: redirectChain.length,
+				status: response.status,
+				url: nextUrl.toString(),
+			};
+		}
+
+		currentUrl = nextValidation.url.toString();
+	}
+
+	return {
+		ok: false,
+		error: `Too many redirects (>${MAX_REDIRECT_HOPS})`,
+		pinnedAddress: lastPinnedAddress,
+		redirectChain,
+		redirectCount: redirectChain.length,
+		url: currentUrl,
+	};
+}
+
+// ── Adaptive cap resolution (pure, exported for tests) ──────────────
+
+/** Input parameters for resolving the effective byte cap. */
+export interface CapResolutionInput {
+	/** Explicit maxBytes from the user's tool-call parameters. */
+	userMaxBytes: number | undefined;
+	/** Budget envelope consumed for this tool call (undefined = no planner). */
+	envelope: ContextBudgetEnvelope | undefined;
+	/** Hard policy floor in bytes. */
+	policyMin: number;
+	/** Hard policy ceiling in bytes. */
+	policyMax: number;
+	/** Fallback cap when no envelope is present. */
+	defaultMaxBytes: number;
+}
+
+/** Resolved cap with diagnostics. */
+export interface CapResolutionResult {
+	/** Final byte cap to apply to the fetch response. */
+	effectiveMaxBytes: number;
+	/** True when the planner envelope reduced the cap below what the user would have gotten. */
+	budgetLimited: boolean;
+	/** Human-readable explanation of how the cap was chosen. */
+	budgetReason: string;
+	/** Batch size from the envelope (1 when no envelope). */
+	batchSize: number;
+}
+
+/** Minimal JSON contract emitted by dendrite-scraper CLI. */
+interface DendritePayload {
+	readonly attempts?: readonly string[];
+	readonly bot_detected?: boolean;
+	readonly elapsed_ms?: number;
+	readonly error?: string | null;
+	readonly llm_cleaned?: boolean;
+	readonly markdown?: string;
+	readonly ok?: boolean;
+	readonly source?: string;
+	readonly url?: string;
+}
+
+/** Resolved fallback command candidate. */
+interface DendriteCommandCandidate {
+	readonly args: readonly string[];
+	readonly command: string;
+	readonly display: string;
+}
+
+/** Successful dendrite fallback execution. */
+interface DendriteFallbackSuccess {
+	readonly command: string;
+	readonly payload: DendritePayload;
+	readonly source: "binary" | "uvx";
+}
+
+/** Final detail payload returned by the tool. */
+interface WebFetchDetails {
+	readonly attempts?: readonly string[];
+	readonly backend?: "dendrite-scraper" | "http";
+	readonly batchSize?: number;
+	readonly botDetected?: boolean;
+	readonly budgetLimited?: boolean;
+	readonly budgetReason?: string;
+	readonly contentType?: string;
+	readonly effectiveMaxBytes?: number;
+	readonly elapsedMs?: number;
+	readonly error?: string;
+	readonly fallbackCommand?: string;
+	readonly fallbackReason?: string;
+	readonly fallbackUsed?: boolean;
+	readonly isError?: boolean;
+	readonly llmCleaned?: boolean;
+	readonly pinnedAddress?: string;
+	readonly redirectChain?: readonly RedirectHopTelemetry[];
+	readonly redirectCount?: number;
+	readonly source?: string;
+	readonly status?: number;
+	readonly totalBytes?: number;
+	readonly totalBytesExact?: boolean;
+	readonly truncated?: boolean;
+	readonly url?: string;
+}
+
+/** Response body captured with an early streaming cutoff. */
+interface CappedResponseBody {
+	/** Buffered response text, capped at maxBytes + sniff bytes. */
+	readonly text: string;
+	/** Best-known total byte count for the original response. */
+	readonly totalBytes: number;
+	/** Whether totalBytes is exact or only a lower bound. */
+	readonly totalBytesExact: boolean;
+	/** Whether the response stream was cut off early. */
+	readonly truncated: boolean;
+}
+
+/**
+ * Resolve the effective maxBytes cap from all inputs.
+ *
+ * Priority chain:
+ * 1. Start from envelope maxBytes (or defaultMaxBytes when absent).
+ * 2. User maxBytes is a hard upper bound — cap cannot exceed it.
+ * 3. Clamp into [policyMin, policyMax].
+ *
+ * @param input - Cap resolution parameters
+ * @returns Resolved cap with diagnostic metadata
+ */
+export function resolveAdaptiveCap(input: CapResolutionInput): CapResolutionResult {
+	const { userMaxBytes, envelope, policyMin, policyMax, defaultMaxBytes } = input;
+
+	const batchSize = envelope?.batchSize ?? 1;
+	const userCap = userMaxBytes ?? Number.POSITIVE_INFINITY;
+
+	// Step 1: base cap comes from planner envelope or strict fallback.
+	const base = envelope?.maxBytes ?? defaultMaxBytes;
+	let reason = envelope
+		? `planner envelope (${base} bytes, batch ${batchSize})`
+		: `strict fallback (${defaultMaxBytes} bytes)`;
+
+	// Step 2: clamp planner/fallback cap into policy bounds.
+	let effective = Math.min(policyMax, Math.max(policyMin, base));
+	if (effective !== base) {
+		reason +=
+			effective < base
+				? ` → capped by policy max (${policyMax})`
+				: ` → raised to policy min (${policyMin})`;
+	}
+
+	// Step 3: explicit user maxBytes is a hard upper bound.
+	if (Number.isFinite(userCap) && effective > userCap) {
+		effective = userCap;
+		reason += ` → capped by user maxBytes (${userCap})`;
+	}
+
+	const withoutEnvelope = Number.isFinite(userCap)
+		? Math.min(userCap, Math.min(policyMax, Math.max(policyMin, defaultMaxBytes)))
+		: Math.min(policyMax, Math.max(policyMin, defaultMaxBytes));
+	const budgetLimited = envelope !== undefined && effective < withoutEnvelope;
+
+	return { effectiveMaxBytes: effective, budgetLimited, budgetReason: reason, batchSize };
+}
+
+/**
+ * Truncate text to a maximum UTF-8 byte length.
+ *
+ * @param text - Source text
+ * @param maxBytes - Maximum number of UTF-8 bytes to keep
+ * @returns Truncated text at a valid character boundary
+ */
+function truncateTextToBytes(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
+	let end = Math.min(text.length, maxBytes);
+	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf-8") > maxBytes) {
+		end -= 1;
+	}
+	return text.slice(0, end);
+}
+
+/**
+ * Decide whether the dendrite fallback is worth trying.
+ *
+ * @param input - HTTP outcome and fetch error context
+ * @returns Human-readable fallback reason, or undefined when plain HTTP is good enough
+ */
+export function shouldUseDendriteFallback(input: {
+	readonly contentType?: string;
+	readonly error?: string;
+	readonly format?: "html" | "markdown" | "text";
+	readonly responseText?: string;
+	readonly status?: number;
+}): string | undefined {
+	if (input.format === "html") return undefined;
+	if (input.error) return `fetch error (${input.error})`;
+	if (input.status !== undefined && DENDRITE_RETRYABLE_STATUSES.has(input.status)) {
+		return `HTTP ${input.status}`;
+	}
+
+	const contentType = input.contentType ?? "";
+	if (!contentType.includes("text/html")) return undefined;
+
+	const responseText = input.responseText?.trim() ?? "";
+	if (!responseText) return "empty HTML response";
+	for (const marker of DENDRITE_HTML_MARKERS) {
+		if (marker.test(responseText)) return `HTML shell matched ${marker}`;
+	}
+	return undefined;
+}
+
+/**
+ * Parse the JSON output contract emitted by dendrite-scraper.
+ *
+ * @param stdout - Raw process stdout
+ * @returns Parsed payload when stdout is valid JSON, otherwise undefined
+ */
+function parseDendritePayload(stdout: string): DendritePayload | undefined {
+	const trimmed = stdout.trim();
+	if (!trimmed) return undefined;
+
+	try {
+		const parsed: unknown = JSON.parse(trimmed);
+		if (!parsed || typeof parsed !== "object") return undefined;
+		return parsed as DendritePayload;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Build the command candidates for the published dendrite fallback.
+ *
+ * @returns Direct binary first, then uvx package execution
+ */
+function getDendriteCandidates(): readonly DendriteCommandCandidate[] {
+	return [
+		{
+			args: [],
+			command: DENDRITE_COMMAND,
+			display: DENDRITE_COMMAND,
+		},
+		{
+			args: ["--from", DENDRITE_PACKAGE, DENDRITE_COMMAND],
+			command: "uvx",
+			display: `uvx --from ${DENDRITE_PACKAGE} ${DENDRITE_COMMAND}`,
+		},
+	] as const;
+}
+
+/**
+ * Execute the published dendrite fallback until one candidate succeeds.
+ *
+ * @param pi - Extension API for subprocess execution
+ * @param url - URL to scrape
+ * @param signal - Abort signal forwarded from tool execution
+ * @returns Successful fallback payload, or an error string describing why all attempts failed
+ */
+async function runDendriteFallback(
+	pi: ExtensionAPI,
+	url: string,
+	signal: AbortSignal | undefined
+): Promise<
+	| { readonly ok: true; readonly value: DendriteFallbackSuccess }
+	| { readonly error: string; readonly ok: false }
+> {
+	let lastError = "dendrite fallback unavailable";
+
+	for (const candidate of getDendriteCandidates()) {
+		try {
+			const result = await pi.exec(
+				candidate.command,
+				[...candidate.args, "scrape", "--timeout", String(DENDRITE_TIMEOUT_SECONDS), url],
+				{ signal, timeout: DENDRITE_TIMEOUT_MS }
+			);
+			const payload = parseDendritePayload(result.stdout);
+			const stderr = result.stderr.trim();
+			const payloadError = typeof payload?.error === "string" ? payload.error : "";
+			const errorText = payloadError || stderr || `exit ${result.code}`;
+
+			if (payload?.ok === true && typeof payload.markdown === "string" && payload.markdown.trim()) {
+				return {
+					ok: true,
+					value: {
+						command: candidate.display,
+						payload,
+						source: candidate.command === DENDRITE_COMMAND ? "binary" : "uvx",
+					},
+				};
+			}
+
+			lastError = `${candidate.display}: ${errorText}`;
+		} catch (error: unknown) {
+			const msg = error instanceof Error ? error.message : String(error);
+			lastError = `${candidate.display}: ${msg}`;
+		}
+	}
+
+	return { error: lastError, ok: false };
+}
+
+/**
+ * Read a response body incrementally and stop once the retention cap is reached.
+ *
+ * Keeps at most `maxBytes + sniffBytes` in memory so large responses do not
+ * force the tool to buffer the entire body before truncation. When the body is
+ * cut off early and no Content-Length header is available, `totalBytes` is a
+ * lower bound rather than an exact final size.
+ *
+ * @param response - Fetch response to read
+ * @param maxBytes - Output cap requested by the tool
+ * @param sniffBytes - Extra bytes retained for fallback detection heuristics
+ * @returns Buffered text and truncation metadata
+ */
+export async function readResponseBodyWithCap(
+	response: Response,
+	maxBytes: number,
+	sniffBytes: number
+): Promise<CappedResponseBody> {
+	const limit = maxBytes + sniffBytes;
+	const contentLengthHeader = response.headers.get("content-length");
+	const contentLength =
+		typeof contentLengthHeader === "string" && /^\d+$/.test(contentLengthHeader)
+			? Number(contentLengthHeader)
+			: undefined;
+
+	if (!response.body) {
+		const text = await response.text();
+		const totalBytes = Buffer.byteLength(text, "utf-8");
+		return {
+			text,
+			totalBytes,
+			totalBytesExact: true,
+			truncated: totalBytes > limit,
+		};
+	}
+
+	const reader = response.body.getReader();
+	const chunks: Uint8Array[] = [];
+	let bufferedBytes = 0;
+	let observedBytes = 0;
+	let truncated = false;
+
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			if (!value) continue;
+
+			observedBytes += value.byteLength;
+			if (bufferedBytes < limit) {
+				const remaining = limit - bufferedBytes;
+				const chunk = value.byteLength > remaining ? value.slice(0, remaining) : value;
+				chunks.push(chunk);
+				bufferedBytes += chunk.byteLength;
+			}
+
+			if (observedBytes >= limit) {
+				truncated = true;
+				await reader.cancel();
+				break;
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const bufferedText = new TextDecoder().decode(
+		Buffer.concat(chunks.map((chunk) => Buffer.from(chunk)))
+	);
+	const totalBytes = contentLength ?? observedBytes;
+	return {
+		text: bufferedText,
+		totalBytes,
+		totalBytesExact: contentLength !== undefined || !truncated,
+		truncated,
+	};
+}
+
+/**
+ * Apply byte truncation and append a consistent truncation note.
+ *
+ * @param text - Content to limit
+ * @param maxBytes - Byte cap to enforce
+ * @param options - Optional total-byte metadata from streaming reads
+ * @returns Final content plus truncation metadata
+ */
+function finalizeContent(
+	text: string,
+	maxBytes: number,
+	options?: {
+		readonly totalBytes?: number;
+		readonly totalBytesExact?: boolean;
+	}
+): {
+	readonly content: string;
+	readonly totalBytes: number;
+	readonly totalBytesExact: boolean;
+	readonly truncated: boolean;
+} {
+	const measuredBytes = Buffer.byteLength(text, "utf-8");
+	const totalBytes = options?.totalBytes ?? measuredBytes;
+	const totalBytesExact = options?.totalBytesExact ?? true;
+	const truncated = totalBytes > maxBytes || measuredBytes > maxBytes;
+	let content = truncated ? truncateTextToBytes(text, maxBytes) : text;
+	if (truncated) {
+		const totalLabel = totalBytesExact
+			? `${(totalBytes / 1024).toFixed(1)}KB`
+			: `at least ${(totalBytes / 1024).toFixed(1)}KB`;
+		content += `\n\n[Truncated: showing ${(maxBytes / 1024).toFixed(1)}KB of ${totalLabel}]`;
+	}
+	return { content, totalBytes, totalBytesExact, truncated };
+}
 
 /**
  * Registers the web_fetch tool.
+ *
  * @param pi - Extension API for registering tools
+ * @returns void
  */
-export default function (pi: ExtensionAPI) {
+export default function (pi: ExtensionAPI): void {
+	const getBudgetApi = subscribeToBudgetApi(pi.events);
+
 	pi.registerTool({
 		name: "web_fetch",
 		label: "web_fetch",
-		description: `Fetch content from a URL. Returns the page text, truncated to 50KB by default.
+		description: `Fetch content from a URL. Returns page text truncated by context-budget policy (conservative fallback when budget is unknown).
 
 WHEN TO USE:
 - Need to read web page content
 - Fetching documentation or articles
-- Checking API responses`,
+- Checking API responses
+
+SAFETY:
+- Limited to public http/https targets by default
+- Package-based scraping fallback is opt-in via allowPackageFallback`,
 		parameters: Type.Object({
 			url: Type.String({ description: "URL to fetch" }),
 			maxBytes: Type.Optional(
-				Type.Number({ description: "Max bytes before truncation (default 50KB)" })
+				Type.Number({
+					description:
+						"Max bytes before truncation (hard upper bound; may be reduced by context budget)",
+				})
 			),
 			format: Type.Optional(
 				Type.Union([Type.Literal("text"), Type.Literal("markdown"), Type.Literal("html")], {
 					description: 'Output format hint: "text" (default), "markdown", or "html"',
 				})
 			),
+			allowPackageFallback: Type.Optional(
+				Type.Boolean({
+					description:
+						"Allow the tool to run the published dendrite-scraper package via local binary or uvx when plain HTTP is insufficient",
+				})
+			),
 		}),
 
-		async execute(_toolCallId, params, signal, _onUpdate) {
-			const maxBytes = params.maxBytes ?? DEFAULT_MAX_BYTES;
+		async execute(toolCallId, params, signal, _onUpdate) {
+			// ── Adaptive cap ────────────────────────────────────
+			const budgetApi = getBudgetApi();
+			const envelope = budgetApi?.take(toolCallId) ?? undefined;
+
+			const { effectiveMaxBytes, budgetLimited, budgetReason, batchSize } = resolveAdaptiveCap({
+				userMaxBytes: params.maxBytes,
+				envelope,
+				policyMin: POLICY_MIN_BYTES,
+				policyMax: POLICY_MAX_BYTES,
+				defaultMaxBytes: DEFAULT_MAX_BYTES,
+			});
+
+			const maxBytes = effectiveMaxBytes;
+			const baseDetails = {
+				batchSize,
+				budgetLimited,
+				budgetReason,
+				effectiveMaxBytes,
+				url: params.url,
+			} satisfies WebFetchDetails;
+
+			const allowPackageFallback = params.allowPackageFallback === true;
 
 			try {
-				const response = await fetch(params.url, {
-					signal,
-					headers: {
-						"User-Agent":
-							"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-					},
-				});
-
-				if (!response.ok) {
-					const error = `HTTP ${response.status}: ${response.statusText}`;
+				const directFetch = await fetchWithValidatedRedirects(params.url, signal);
+				if (!directFetch.ok) {
 					return {
-						content: [{ type: "text", text: error }],
-						details: { status: response.status, url: params.url, error, isError: true },
+						content: [{ type: "text", text: directFetch.error }],
+						details: {
+							...baseDetails,
+							backend: "http",
+							error: directFetch.error,
+							isError: true,
+							pinnedAddress: directFetch.pinnedAddress,
+							redirectChain: directFetch.redirectChain,
+							redirectCount: directFetch.redirectCount,
+							status: directFetch.status,
+							url: directFetch.url,
+						} satisfies WebFetchDetails,
 					};
 				}
 
+				const { response } = directFetch;
 				const contentType = response.headers.get("content-type") || "";
-				const fullText = await response.text();
-				const totalBytes = new TextEncoder().encode(fullText).length;
-				const truncated = totalBytes > maxBytes;
+				const fetchedUrl = directFetch.url;
+				const httpTelemetry = {
+					pinnedAddress: directFetch.pinnedAddress,
+					redirectChain: directFetch.redirectChain,
+					redirectCount: directFetch.redirectCount,
+				} as const;
+				const body = await readResponseBodyWithCap(response, maxBytes, RESPONSE_SNIFF_BYTES);
+				const fallbackReason = shouldUseDendriteFallback({
+					contentType,
+					format: params.format,
+					responseText: body.text,
+					status: response.status,
+				});
+				const fallbackDisabledNote =
+					fallbackReason && !allowPackageFallback
+						? "\n\nPackage fallback disabled. Re-run with allowPackageFallback: true to allow dendrite-scraper."
+						: "";
+				let fallbackFailure: string | undefined;
 
-				let content = truncated ? fullText.slice(0, maxBytes) : fullText;
-
-				if (truncated) {
-					content += `\n\n[Truncated: showing ${(maxBytes / 1024).toFixed(1)}KB of ${(totalBytes / 1024).toFixed(1)}KB]`;
+				if (fallbackReason && allowPackageFallback) {
+					const fallback = await runDendriteFallback(pi, params.url, signal);
+					if (fallback.ok) {
+						const text = fallback.value.payload.markdown ?? "";
+						const final = finalizeContent(text, maxBytes);
+						return {
+							content: [{ type: "text", text: final.content }],
+							details: {
+								...baseDetails,
+								...httpTelemetry,
+								attempts: fallback.value.payload.attempts,
+								backend: "dendrite-scraper",
+								botDetected: fallback.value.payload.bot_detected,
+								elapsedMs: fallback.value.payload.elapsed_ms,
+								fallbackCommand: fallback.value.command,
+								fallbackReason,
+								fallbackUsed: true,
+								llmCleaned: fallback.value.payload.llm_cleaned,
+								source: fallback.value.payload.source ?? fallback.value.source,
+								totalBytes: final.totalBytes,
+								truncated: final.truncated,
+								url: fallback.value.payload.url ?? fetchedUrl,
+							} satisfies WebFetchDetails,
+						};
+					}
+					fallbackFailure = fallback.error;
 				}
 
+				if (!response.ok) {
+					const error = `HTTP ${response.status}: ${response.statusText}`;
+					const fallback = fallbackFailure
+						? `\n\nDendrite fallback failed: ${fallbackFailure}`
+						: fallbackDisabledNote;
+					return {
+						content: [{ type: "text", text: `${error}${fallback}` }],
+						details: {
+							...baseDetails,
+							...httpTelemetry,
+							backend: "http",
+							contentType,
+							error: `${error}${fallback}`,
+							fallbackReason,
+							fallbackUsed: Boolean(fallbackReason && allowPackageFallback),
+							isError: true,
+							status: response.status,
+							url: fetchedUrl,
+						} satisfies WebFetchDetails,
+					};
+				}
+
+				const final = finalizeContent(body.text, maxBytes, {
+					totalBytes: body.totalBytes,
+					totalBytesExact: body.totalBytesExact,
+				});
 				return {
-					content: [{ type: "text", text: content }],
+					content: [{ type: "text", text: final.content }],
 					details: {
-						url: params.url,
-						status: response.status,
+						...baseDetails,
+						...httpTelemetry,
+						backend: "http",
 						contentType,
-						totalBytes,
-						truncated,
-					},
+						status: response.status,
+						totalBytes: final.totalBytes,
+						totalBytesExact: final.totalBytesExact,
+						truncated: final.truncated,
+						url: fetchedUrl,
+					} satisfies WebFetchDetails,
 				};
 			} catch (error: unknown) {
 				const msg = error instanceof Error ? error.message : String(error);
+				const fallbackReason = shouldUseDendriteFallback({ error: msg, format: params.format });
+				const fallbackDisabledNote =
+					fallbackReason && !allowPackageFallback
+						? "\n\nPackage fallback disabled. Re-run with allowPackageFallback: true to allow dendrite-scraper."
+						: "";
+				let fallbackFailure: string | undefined;
+				if (fallbackReason && allowPackageFallback) {
+					const fallback = await runDendriteFallback(pi, params.url, signal);
+					if (fallback.ok) {
+						const text = fallback.value.payload.markdown ?? "";
+						const final = finalizeContent(text, maxBytes);
+						return {
+							content: [{ type: "text", text: final.content }],
+							details: {
+								...baseDetails,
+								attempts: fallback.value.payload.attempts,
+								backend: "dendrite-scraper",
+								botDetected: fallback.value.payload.bot_detected,
+								elapsedMs: fallback.value.payload.elapsed_ms,
+								fallbackCommand: fallback.value.command,
+								fallbackReason,
+								fallbackUsed: true,
+								llmCleaned: fallback.value.payload.llm_cleaned,
+								source: fallback.value.payload.source ?? fallback.value.source,
+								totalBytes: final.totalBytes,
+								truncated: final.truncated,
+								url: fallback.value.payload.url ?? params.url,
+							} satisfies WebFetchDetails,
+						};
+					}
+					fallbackFailure = fallback.error;
+				}
+
+				const errorText = `Fetch error: ${msg}${fallbackFailure ? `\n\nDendrite fallback failed: ${fallbackFailure}` : fallbackDisabledNote}`;
 				return {
-					content: [{ type: "text", text: `Fetch error: ${msg}` }],
-					details: { url: params.url, error: msg, isError: true },
+					content: [{ type: "text", text: errorText }],
+					details: {
+						...baseDetails,
+						backend: "http",
+						error: errorText,
+						fallbackReason,
+						fallbackUsed: Boolean(fallbackReason && allowPackageFallback),
+						isError: true,
+					} satisfies WebFetchDetails,
 				};
 			}
 		},
@@ -99,43 +1118,57 @@ WHEN TO USE:
 		},
 
 		renderResult(result, { expanded }, theme) {
-			const details = result.details as
-				| {
-						url?: string;
-						error?: string;
-						isError?: boolean;
-						totalBytes?: number;
-						truncated?: boolean;
-				  }
-				| undefined;
+			const details = result.details as WebFetchDetails | undefined;
 			if (!details) {
 				const text = result.content[0];
 				return renderLines([text?.type === "text" ? text.text : "(no output)"]);
 			}
 
-			// Build the summary footer
+			// Build the summary footer.
 			let footer: string;
 			if (details.isError) {
 				footer = theme.fg("error", `${getIcon("error")} ${details.error || "Failed"}`);
 			} else {
+				const backend =
+					details.backend === "dendrite-scraper"
+						? ` via dendrite-scraper${details.source ? `/${details.source}` : ""}`
+						: "";
 				const size = details.totalBytes ? ` (${(details.totalBytes / 1024).toFixed(1)}KB)` : "";
 				const truncNote = details.truncated ? " [truncated]" : "";
+				const budgetNote = details.budgetLimited ? " [budget-limited]" : "";
+				const redirectNote =
+					typeof details.redirectCount === "number" && details.redirectCount > 0
+						? ` [redirects:${details.redirectCount}]`
+						: "";
+				const pinnedNote = details.pinnedAddress ? ` [ip:${details.pinnedAddress}]` : "";
 				footer =
 					theme.fg("success", `${getIcon("success")} `) +
-					theme.fg("dim", details.url ?? "") +
-					theme.fg("muted", size + truncNote);
+					theme.fg("dim", `${details.url ?? ""}${backend}`) +
+					theme.fg("muted", size + truncNote + budgetNote + redirectNote + pinnedNote);
 			}
 
-			// Expanded: content preview first, footer last
+			// Expanded: content preview first, footer last.
 			if (expanded && !details.isError) {
 				const text = result.content[0];
 				const content = text?.type === "text" ? text.text : "";
 				const preview = content.slice(0, 500) + (content.length > 500 ? "..." : "");
-				const contentLines = preview.split("\n").map((l) => theme.fg("dim", l));
-				return renderLines([...contentLines, footer]);
+				const contentLines = preview.split("\n").map((line) => theme.fg("dim", line));
+				const telemetryLines: string[] = [];
+				if (details.pinnedAddress) {
+					telemetryLines.push(theme.fg("muted", `pinned ip: ${details.pinnedAddress}`));
+				}
+				for (const hop of details.redirectChain ?? []) {
+					telemetryLines.push(
+						theme.fg(
+							"muted",
+							`redirect ${hop.status}: ${hop.fromUrl} -> ${hop.toUrl}${hop.pinnedAddress ? ` (ip ${hop.pinnedAddress})` : ""}`
+						)
+					);
+				}
+				return renderLines([...contentLines, ...telemetryLines, footer]);
 			}
 
-			// Collapsed: footer only
+			// Collapsed: footer only.
 			return renderLines([footer]);
 		},
 	});

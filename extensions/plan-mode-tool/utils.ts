@@ -3,6 +3,66 @@
  * Extracted for testability — no extension API dependencies.
  */
 
+// ── Natural language plan intent detection ──────────────────────────────
+
+/**
+ * Curated patterns that unambiguously express "enter planning mode".
+ * Each pattern uses word boundaries to avoid matching plan-as-noun usage
+ * (e.g. "make a plan for X") or questions about plan mode.
+ */
+export const PLAN_INTENT_PATTERNS: readonly RegExp[] = [
+	// Composite patterns first — avoids partial stripping of overlapping phrases
+	/\bthis\s+is\s+plan(ning)?(\s+only)?\b/i,
+	/\bplan[\s-]only\b/i,
+	/\bjust\s+plan\b/i,
+	/\bonly\s+plan\b/i,
+	/\bplan\s+mode\b(?!\s*(\?|do|work|mean))/i,
+	/\bplanning\s+mode\b(?!\s*(\?|do|work|mean))/i,
+	/\bdon['\u2019]?t\s+(implement|code|execute|make\s+changes)\b/i,
+	/\bdo\s+not\s+(implement|code|execute|make\s+changes)\b/i,
+	/\bno\s+(implementation|changes|coding)\s+(yet|first|for\s+now)\b/i,
+	/\bread[\s-]only\s+mode\b/i,
+	/\bplan\s+(first|before)\b/i,
+];
+
+/**
+ * Detects whether user input contains a strong planning-intent directive.
+ *
+ * Only matches unambiguous directives like "plan only" or "don't implement".
+ * Does NOT match noun usage ("the plan is…") or questions ("what does plan mode do?").
+ *
+ * @param text - Raw user input
+ * @returns true when any plan-intent pattern matches
+ */
+export function detectPlanIntent(text: string): boolean {
+	return PLAN_INTENT_PATTERNS.some((pattern) => pattern.test(text));
+}
+
+/**
+ * Strips plan-intent phrases from user input, preserving the actual request.
+ *
+ * If stripping leaves an empty string (the entire message was just "plan only"),
+ * returns the original text so the model has something to work with.
+ *
+ * @param text - Raw user input
+ * @returns Cleaned text with plan-intent phrases removed, or original if nothing remains
+ */
+export function stripPlanIntent(text: string): string {
+	let stripped = text;
+	for (const pattern of PLAN_INTENT_PATTERNS) {
+		stripped = stripped.replace(pattern, "");
+	}
+	// Clean up artifacts: leading/trailing punctuation, double spaces, dangling commas
+	stripped = stripped
+		.replace(/^[\s,.\-—;:]+/, "")
+		.replace(/[\s,.\-—;:]+$/, "")
+		.replace(/\s{2,}/g, " ")
+		.trim();
+	return stripped || text;
+}
+
+// ── Bash safety ─────────────────────────────────────────────────────────
+
 /** Patterns for destructive commands that are blocked in plan mode */
 const DESTRUCTIVE_PATTERNS = [
 	/\brm\b/i,
@@ -194,33 +254,4 @@ export function extractTodoItems(message: string): TodoItem[] {
 		}
 	}
 	return items;
-}
-
-/**
- * Extracts [DONE:n] step markers from a message.
- * @param message - The message text to search
- * @returns Array of step numbers that were marked as done
- */
-export function extractDoneSteps(message: string): number[] {
-	const steps: number[] = [];
-	for (const match of message.matchAll(/\[DONE:(\d+)\]/gi)) {
-		const step = Number(match[1]);
-		if (Number.isFinite(step)) steps.push(step);
-	}
-	return steps;
-}
-
-/**
- * Marks todo items as completed based on [DONE:n] markers in text.
- * @param text - The text containing [DONE:n] markers
- * @param items - The todo items to update
- * @returns The number of items that were marked as completed
- */
-export function markCompletedSteps(text: string, items: TodoItem[]): number {
-	const doneSteps = extractDoneSteps(text);
-	for (const step of doneSteps) {
-		const item = items.find((t) => t.step === step);
-		if (item) item.completed = true;
-	}
-	return doneSteps.length;
 }

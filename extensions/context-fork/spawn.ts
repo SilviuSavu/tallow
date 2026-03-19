@@ -6,10 +6,13 @@
  * runSingleAgent — no event emission, abort handling, or streaming updates.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import {
+	DEFAULT_AGENT_RUNNER_ENV,
+	spawnWithResolvedAgentRunner,
+} from "../../runtime/agent-runner.js";
 import { expandFileReferences } from "../file-reference/index.js";
 
 /** Configuration for spawning a forked subprocess. */
@@ -107,7 +110,7 @@ export async function buildForkArgs(
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 
 	if (options.model) {
-		args.push("--models", options.model);
+		args.push("--model", options.model);
 	}
 	if (options.tools && options.tools.length > 0) {
 		args.push("--tools", options.tools.join(","));
@@ -150,14 +153,29 @@ export async function spawnForkSubprocess(options: ForkOptions): Promise<ForkRes
 
 		const args = await buildForkArgs(options, systemPromptPath);
 		const events: PiJsonEvent[] = [];
-
-		const exitCode = await new Promise<number>((resolve) => {
-			const proc = spawn("pi", args, {
+		const forkSpawn = await spawnWithResolvedAgentRunner({
+			args,
+			runnerLabel: "Context fork",
+			resolution: {
+				overrideEnvVar: DEFAULT_AGENT_RUNNER_ENV,
+			},
+			spawnOptions: {
 				cwd: options.cwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: { ...process.env, PI_IS_SUBAGENT: "1" } as Record<string, string>,
-			});
+			},
+		});
+		if (!forkSpawn.ok) {
+			throw new Error(forkSpawn.reason);
+		}
+
+		const exitCode = await new Promise<number>((resolve) => {
+			const proc = forkSpawn.proc;
+			if (!proc.stdout || !proc.stderr) {
+				resolve(1);
+				return;
+			}
 
 			let buffer = "";
 

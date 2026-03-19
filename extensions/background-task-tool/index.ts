@@ -8,7 +8,7 @@
  * - `task_output` tool: Retrieve output from a background task
  * - `task_status` tool: Check if a task is running or completed
  * - `/bg` command: List and manage background tasks
- * - Status widget shows running background tasks
+ * - Live widget shows running background tasks when the tasks extension is not presenting them
  *
  * Usage:
  *   Ask the agent to "run npm test in the background"
@@ -25,9 +25,7 @@ import {
 	type Theme,
 } from "@mariozechner/pi-coding-agent";
 import {
-	Container,
 	Key,
-	Loader,
 	matchesKey,
 	Text,
 	type TUI,
@@ -35,7 +33,7 @@ import {
 	visibleWidth,
 } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { getIcon, getSpinner } from "../_icons/index.js";
+import { getIcon } from "../_icons/index.js";
 import { extractPreview, isInlineResultsEnabled } from "../_shared/inline-preview.js";
 import {
 	emitInteropEvent,
@@ -43,9 +41,16 @@ import {
 	INTEROP_EVENT_NAMES,
 	type InteropBackgroundTaskView,
 	onInteropEvent,
+	requestInteropState,
 } from "../_shared/interop-events.js";
 import { registerPid, unregisterPid } from "../_shared/pid-registry.js";
-import { enforceExplicitPolicy, recordAudit } from "../_shared/shell-policy.js";
+import {
+	enforceExplicitPolicy,
+	evaluateCommand,
+	isYoloMode,
+	recordAudit,
+	type ShellConfirmResponse,
+} from "../_shared/shell-policy.js";
 import { getTallowSettingsPath } from "../_shared/tallow-paths.js";
 import {
 	appendSection,
@@ -123,16 +128,38 @@ let piRef: ExtensionAPI | null = null;
  */
 const promotedAbortControllers = new Map<string, AbortController>();
 
-// TUI reference captured at session_start for Loader in renderResult
+// TUI reference captured at session_start for widgets
 let tuiRef: TUI | null = null;
-
-// Persistent Loader instances per streaming task (avoids leaking intervals)
-const activeLoaders = new Map<string, InstanceType<typeof Loader>>();
 
 // In-memory task registry (published via typed interop events)
 const tasks = new Map<string, BackgroundTask>();
 let taskCounter = 0;
+let backgroundTaskPresenterActive = false;
+let interopPresenterStateCleanup: (() => void) | undefined;
 let interopStateRequestCleanup: (() => void) | undefined;
+
+/** Shared mutable state for live-updating anchor components during consecutive polls. */
+export interface PollState {
+	taskId: string;
+	latestStatus: string;
+	latestDuration: string;
+	latestExitCode: number | null;
+	pollCount: number;
+	/** Only set for task_output anchors. */
+	latestOutput?: string;
+	/** Only set for task_output anchors. */
+	latestOutputLines?: number;
+	/** Only set for task_output anchors. */
+	latestOutputBytes?: number;
+	/** Only set for task_output anchors. */
+	latestCommand?: string;
+}
+
+/** Active poll states keyed by "tool_name:taskId". */
+const pollStates = new Map<string, PollState>();
+
+/** Last completed poll tool call, used to detect consecutive same-tool same-taskId calls. */
+let lastCompletedPoll: { toolName: string; taskId: string } | null = null;
 
 /**
  * Build a serializable background task snapshot for cross-extension consumers.
@@ -197,6 +224,37 @@ function cleanupOldTasks(): void {
  */
 export function setBackgroundTaskSpawnForTests(implementation?: typeof spawn): void {
 	spawnProcess = implementation ?? spawn;
+}
+
+/**
+ * Reset poll tracking state for tests.
+ *
+ * @internal
+ * @returns Nothing
+ */
+export function resetPollStateForTests(): void {
+	pollStates.clear();
+	lastCompletedPoll = null;
+}
+
+/**
+ * Get the last completed poll for tests.
+ *
+ * @internal
+ * @returns The last completed poll or null
+ */
+export function getLastCompletedPollForTests(): { toolName: string; taskId: string } | null {
+	return lastCompletedPoll;
+}
+
+/**
+ * Get the current poll states map for tests.
+ *
+ * @internal
+ * @returns ReadonlyMap of poll state key to poll state
+ */
+export function getPollStatesForTests(): ReadonlyMap<string, PollState> {
+	return pollStates;
 }
 
 /** Handle for updating a task that was promoted from bash to background. */
@@ -406,7 +464,7 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 	piEventsRef = pi.events;
 	piRef = pi;
 
-	// Register inline result renderer for fire-and-forget task completions
+	// Register inline result renderer for background task completions
 	pi.registerMessageRenderer<BgTaskCompleteDetails>(
 		"background-task-complete",
 		(message, _options, theme) => {
@@ -452,10 +510,8 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 	);
 
 	/**
-	 * Post an inline notification when a fire-and-forget task completes.
-	 *
+	 * Post an inline notification when a background task completes.
 	 * Checks the inlineAgentResults setting before posting.
-	 * Only fires for fire-and-forget tasks (background: true).
 	 *
 	 * @param task - Completed background task
 	 * @returns void
@@ -485,12 +541,36 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 		});
 	}
 
+	/** Debounce timer for widget updates during rapid output. */
+	let widgetDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+
+	/** Minimum interval between widget re-renders (milliseconds). */
+	const WIDGET_DEBOUNCE_MS = 150;
+
+	/** Maximum tail lines per task in the widget. */
+	const WIDGET_TAIL_LINES = 3;
+
+	/** Most recent UI context used for widget/status updates. */
+	let lastWidgetContext: ExtensionContext | null = null;
+
+	/**
+	 * Whether the tasks extension currently owns background-task presentation.
+	 *
+	 * When true, background-task-tool suppresses its duplicate live widget and
+	 * lets the tasks widget render the canonical summary row.
+	 *
+	 * @returns True when the tasks widget should be the only presenter
+	 */
+	function shouldSuppressTaskWidget(): boolean {
+		return backgroundTaskPresenterActive;
+	}
+
 	/**
 	 * Updates the status bar indicator for running background tasks.
+	 *
 	 * @param ctx - Extension context for UI access
 	 */
-	function updateWidget(ctx: ExtensionContext): void {
-		// Guard: ctx.ui may be undefined if context is stale (e.g., from async callback after shutdown)
+	function updateStatusBar(ctx: ExtensionContext): void {
 		if (!ctx?.ui) return;
 
 		const running = [...tasks.values()].filter((t) => t.status === "running");
@@ -500,8 +580,60 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 			return;
 		}
 
-		// Status bar only - widget is rendered by tasks extension
 		ctx.ui.setStatus("bg-tasks", `${FG_PURPLE}⚙ ${running.length} bg${RESET_ALL}`);
+	}
+
+	/**
+	 * Render the bottom widget showing live output from running background tasks.
+	 * Shows each running task with a compact command preview and tail output.
+	 * Placed above the editor so async work is visible without cluttering the chat.
+	 *
+	 * @param ctx - Extension context for widget access
+	 */
+	function updateTaskWidget(ctx: ExtensionContext): void {
+		if (!ctx?.ui) return;
+
+		const running = [...tasks.values()].filter((t) => t.status === "running");
+
+		if (running.length === 0 || shouldSuppressTaskWidget()) {
+			ctx.ui.setWidget("bg-tasks", undefined);
+			return;
+		}
+
+		const lines: string[] = [];
+		for (const task of running) {
+			const elapsed = formatDuration(Date.now() - task.startTime);
+			const cmd = truncateCommand(task.command, 50);
+			const lineCount = task.output.join("").split("\n").length;
+			const header = `${FG_PURPLE}⚙${RESET_ALL} ${FG_WHITE}${cmd}${RESET_ALL} ${FG_PURPLE_MUTED}(${elapsed}, ${lineCount} lines)${RESET_ALL}`;
+			lines.push(header);
+
+			// Show tail output lines
+			const fullOutput = task.output.join("");
+			if (fullOutput.length > 0) {
+				const outputLines = fullOutput.split("\n").filter((l) => l.trim().length > 0);
+				const tail = outputLines.slice(-WIDGET_TAIL_LINES);
+				for (const line of tail) {
+					const clean = line.length > 80 ? `${line.slice(0, 79)}…` : line;
+					lines.push(`  ${FG_PURPLE_MUTED}│${RESET_ALL} ${FG_PURPLE_MUTED}${clean}${RESET_ALL}`);
+				}
+			}
+		}
+
+		ctx.ui.setWidget("bg-tasks", lines, { placement: "aboveEditor" });
+	}
+
+	/**
+	 * Debounced widget update — called from onData to avoid thrashing renders.
+	 *
+	 * @param ctx - Extension context for widget access
+	 */
+	function debouncedWidgetUpdate(ctx: ExtensionContext): void {
+		if (widgetDebounceTimer) return;
+		widgetDebounceTimer = setTimeout(() => {
+			widgetDebounceTimer = null;
+			updateTaskWidget(ctx);
+		}, WIDGET_DEBOUNCE_MS);
 	}
 
 	/**
@@ -511,9 +643,24 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 	 * @returns void
 	 */
 	function syncTaskState(ctx: ExtensionContext): void {
-		updateWidget(ctx);
+		lastWidgetContext = ctx;
+		updateStatusBar(ctx);
+		updateTaskWidget(ctx);
 		publishBackgroundTaskSnapshot(pi.events);
 	}
+
+	interopPresenterStateCleanup?.();
+	interopPresenterStateCleanup = onInteropEvent(
+		pi.events,
+		INTEROP_EVENT_NAMES.backgroundTasksPresenterState,
+		(payload) => {
+			backgroundTaskPresenterActive = payload.active;
+			const currentContext = lastWidgetContext;
+			if (currentContext?.ui) {
+				updateTaskWidget(currentContext);
+			}
+		}
+	);
 
 	interopStateRequestCleanup?.();
 	interopStateRequestCleanup = onInteropEvent(pi.events, INTEROP_EVENT_NAMES.stateRequest, () => {
@@ -529,12 +676,27 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 	publishPromoteApi();
 	pi.events.on(INTEROP_API_CHANNELS.promoteToBackgroundApiRequest, publishPromoteApi);
 
+	// ── Consecutive poll detection ──────────────────────────────────────────────
+	// Reset the consecutive poll chain when any non-poll tool starts executing.
+	pi.on("tool_call", async (event) => {
+		if (event.toolName !== "task_status" && event.toolName !== "task_output") {
+			lastCompletedPoll = null;
+			pollStates.clear();
+		}
+	});
+
+	// Clear poll state across agent loops to prevent stale anchors.
+	pi.on("agent_end", async () => {
+		lastCompletedPoll = null;
+		pollStates.clear();
+	});
+
 	// Tool: Run bash in background
 	pi.registerTool({
 		name: "bg_bash",
 		label: "bg_bash",
 		description:
-			"Run a bash command in the background. By default, streams live output and waits for completion. Set background=true for fire-and-forget daemons/servers.\n\nWHEN TO USE:\n- Starting daemons or servers (with background: true)\n- Long-running builds or tests (default: streams output)\n- Any process you want to run independently\n\nWARNING: Never use bash tool with & to background processes - it will hang. Use bg_bash instead.",
+			"Run a bash command in the background. Returns immediately without blocking. When the tasks extension is active, progress appears in the Background Tasks widget; otherwise background-task-tool shows its own live widget.\n\nWHEN TO USE:\n- Starting daemons or servers\n- Long-running builds or tests\n- Any process you want to run independently\n\nThe command runs asynchronously. Use task_status/task_output to check results.\n\nWARNING: Never use bash tool with & to background processes - it will hang. Use bg_bash instead.",
 		parameters: Type.Object({
 			command: Type.String({
 				description: "Bash command to run in background",
@@ -546,15 +708,13 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 			),
 			background: Type.Optional(
 				Type.Boolean({
-					description:
-						"If true, return immediately without streaming output. Use for daemons/servers.",
+					description: "Deprecated — bg_bash always runs in background. Ignored.",
 				})
 			),
 		}),
-		async execute(_toolCallId, params, signal, onUpdate, ctx) {
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
 			const taskId = generateTaskId();
 			const cwd = ctx.cwd;
-			const fireAndForget = params.background === true;
 
 			const task: BackgroundTask = {
 				id: taskId,
@@ -584,7 +744,7 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 				registerPid(child.pid, params.command);
 			}
 
-			// Buffer output (and stream if not fire-and-forget)
+			// Buffer output and update widget (never blocks the agent)
 			const onData = (data: Buffer) => {
 				// Guard: ignore data arriving after task is no longer running
 				if (task.status !== "running") return;
@@ -599,14 +759,8 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 					}
 				}
 
-				// Stream live updates to the TUI
-				if (!fireAndForget) {
-					const output = task.output.join("");
-					onUpdate?.({
-						content: [{ type: "text", text: output || "(no output yet)" }],
-						details: { taskId },
-					});
-				}
+				// Update the bottom widget with live output (debounced)
+				debouncedWidgetUpdate(ctx);
 			};
 
 			const lifecycle = createProcessLifecycle({
@@ -628,7 +782,7 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 					task.process = null;
 					syncTaskState(ctx);
 				},
-				signal: fireAndForget ? undefined : signal,
+				signal: undefined,
 				timeoutMs: params.timeout && params.timeout > 0 ? params.timeout * 1000 : undefined,
 			});
 
@@ -672,63 +826,25 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 				syncTaskState(ctx);
 			};
 
-			// Fire-and-forget: return immediately
-			if (fireAndForget) {
-				void lifecycle.waitForExit().then((result) => {
-					applyLifecycleResult({
-						...(result.type === "close" ? { code: result.code } : {}),
-						...(result.type === "error" ? { error: result.error } : {}),
-						type: result.type,
-					});
-					postInlineResult(task);
+			// Always non-blocking: return immediately, process runs in background
+			void lifecycle.waitForExit().then((result) => {
+				applyLifecycleResult({
+					...(result.type === "close" ? { code: result.code } : {}),
+					...(result.type === "error" ? { error: result.error } : {}),
+					type: result.type,
 				});
-				lifecycle.detach();
-				syncTaskState(ctx);
-
-				return {
-					details: { taskId, command: params.command, fireAndForget: true },
-					content: [
-						{
-							type: "text",
-							text: `Background task started (fire-and-forget).\nTask ID: ${taskId}\nCommand: ${params.command}\nUse task_output("${taskId}") to check later.`,
-						},
-					],
-				};
-			}
-
-			// Streaming mode: wait for process to complete
-			syncTaskState(ctx);
-
-			const lifecycleResult = await lifecycle.waitForExit();
-			applyLifecycleResult({
-				...(lifecycleResult.type === "close" ? { code: lifecycleResult.code } : {}),
-				...(lifecycleResult.type === "error" ? { error: lifecycleResult.error } : {}),
-				type: lifecycleResult.type,
+				postInlineResult(task);
 			});
-
-			// Stop and clean up the persistent Loader for this task
-			const loader = activeLoaders.get(taskId);
-			if (loader) {
-				loader.stop();
-				activeLoaders.delete(taskId);
-			}
-
-			const output = task.output.join("");
-			const duration = formatDuration((task.endTime || Date.now()) - task.startTime);
+			lifecycle.detach();
+			syncTaskState(ctx);
+			lastCompletedPoll = null;
 
 			return {
-				details: {
-					taskId,
-					command: params.command,
-					status: task.status,
-					duration,
-					exitCode: task.exitCode,
-					output,
-				},
+				details: { taskId, command: params.command },
 				content: [
 					{
 						type: "text",
-						text: output || "(no output)",
+						text: `Background task started.\nTask ID: ${taskId}\nCommand: ${params.command}\nUse task_status("${taskId}") to check progress.\nUse task_output("${taskId}") to retrieve output.`,
 					},
 				],
 			};
@@ -736,149 +852,22 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 
 		renderCall(args, theme) {
 			const cmd = truncateCommand(args.command as string, 60);
-			const bg = args.background ? formatPresentationText(theme, "meta", " (detached)") : "";
 			return new Text(
 				formatPresentationText(theme, "title", "bg_bash ") +
-					formatPresentationText(theme, "action", cmd) +
-					bg,
+					formatPresentationText(theme, "action", cmd),
 				0,
 				0
 			);
 		},
 
-		renderResult(result, { expanded, isPartial }, theme) {
-			const details = result.details as
-				| {
-						fireAndForget?: boolean;
-						taskId?: string;
-						status?: string;
-						duration?: string;
-						exitCode?: number | null;
-				  }
-				| undefined;
-
-			// Fire-and-forget: compact one-liner
-			if (details?.fireAndForget) {
-				return renderLines([
-					formatPresentationText(theme, "status_success", "⚙ Started (detached)"),
-				]);
-			}
-
-			const COLLAPSED_LINES = 10;
-			const EXPANDED_LINES = 50;
-
-			// Extract output (available during streaming via onUpdate and after completion)
-			const text = result.content[0];
-			const output = text?.type === "text" ? text.text : "";
-
-			// While running: show streamed output + loader spinner at bottom
-			if (isPartial) {
-				const container = new Container();
-
-				if (output) {
-					const allLines = output.split("\n").filter((l: string) => l.length > 0);
-					const maxLines = COLLAPSED_LINES;
-					const truncated = allLines.length > maxLines;
-					const tail = truncated ? allLines.slice(-maxLines) : allLines;
-					const lines: string[] = [];
-					if (truncated) {
-						appendSection(lines, [
-							formatPresentationText(
-								theme,
-								"meta",
-								`... ${allLines.length - maxLines} more lines above`
-							),
-						]);
-					}
-					appendSection(
-						lines,
-						tail.map((line) => styleBackgroundOutputLine(theme, line))
-					);
-					container.addChild(renderLines(lines, { wrap: true }));
-				}
-
-				// Reuse persistent Loader (one per task, avoids leaking intervals)
-				const tid = details?.taskId ?? "__bg_default";
-				let loader = activeLoaders.get(tid);
-				if (!loader && tuiRef) {
-					loader = new Loader(
-						tuiRef,
-						(s) => theme.fg("warning", s),
-						(s) => theme.fg("muted", s),
-						"Running..."
-					);
-					(loader as unknown as Record<string, string[]>).frames = getSpinner();
-					activeLoaders.set(tid, loader);
-				}
-				if (loader) {
-					container.addChild(loader);
-				} else {
-					container.addChild(
-						new Text(formatPresentationText(theme, "status_warning", "Running..."), 0, 0)
-					);
-				}
-
-				return container;
-			}
-
-			// Completed: show output
-			if (!output) return renderLines([formatPresentationText(theme, "meta", "(no output)")]);
-
-			const allLines = output.split("\n").filter((l: string) => l.length > 0);
-			const maxLines = expanded ? EXPANDED_LINES : COLLAPSED_LINES;
-			const truncated = allLines.length > maxLines;
-			const tail = truncated ? allLines.slice(-maxLines) : allLines;
-			const lines: string[] = [];
-
-			if (truncated) {
-				appendSection(lines, [
-					formatPresentationText(
-						theme,
-						"meta",
-						`... ${allLines.length - maxLines} more lines above`
-					),
-				]);
-			}
-			appendSection(
-				lines,
-				tail.map((line) => styleBackgroundOutputLine(theme, line))
-			);
-			if (truncated && !expanded) {
-				appendSection(lines, [
-					`${formatPresentationText(theme, "meta", `... ${allLines.length - maxLines} more lines`)} ${formatPresentationText(theme, "hint", keyHint("expandTools", "to expand"))}`,
-				]);
-			}
-
-			if (details?.status) {
-				const statusIcon =
-					details.status === "completed"
-						? getIcon("success")
-						: details.status === "running"
-							? getIcon("in_progress")
-							: getIcon("error");
-				const statusRole =
-					details.status === "completed"
-						? "status_success"
-						: details.status === "running"
-							? "status_warning"
-							: "status_error";
-				const statusMetaParts: string[] = [];
-				if (details.exitCode !== null && details.exitCode !== undefined) {
-					statusMetaParts.push(`exit ${details.exitCode}`);
-				}
-				if (details.duration) statusMetaParts.push(details.duration);
-				const statusMeta = statusMetaParts.length > 0 ? ` (${statusMetaParts.join(", ")})` : "";
-				appendSection(
-					lines,
-					[
-						formatPresentationText(theme, statusRole, `${statusIcon} bg_bash ${details.status}`) +
-							formatPresentationText(theme, "meta", statusMeta),
-					],
-					{ blankBefore: true }
-				);
-			}
-
-			return renderLines(lines, { wrap: expanded });
+		renderResult(result, _opts, theme) {
+			// bg_bash always returns immediately — compact one-liner
+			const details = result.details as { taskId?: string; command?: string } | undefined;
+			const taskId = details?.taskId ?? "?";
+			return renderLines([
+				formatPresentationText(theme, "status_success", `⚙ Started`) +
+					formatPresentationText(theme, "meta", ` → task_output("${taskId}")`),
+			]);
 		},
 	});
 
@@ -914,7 +903,28 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 				output = lines.slice(-params.tail).join("\n");
 			}
 
+			const key = `task_output:${params.taskId}`;
+			const isConsecutive =
+				lastCompletedPoll?.toolName === "task_output" &&
+				lastCompletedPoll?.taskId === params.taskId;
+
 			const duration = formatDuration((task.endTime || Date.now()) - task.startTime);
+
+			if (isConsecutive) {
+				const state = pollStates.get(key);
+				if (state) {
+					state.latestStatus = task.status;
+					state.latestDuration = duration;
+					state.latestExitCode = task.exitCode ?? null;
+					state.pollCount++;
+					state.latestOutput = output;
+					state.latestOutputLines = output.split("\n").length;
+					state.latestOutputBytes = task.outputBytes;
+				}
+			}
+
+			lastCompletedPoll = { toolName: "task_output", taskId: params.taskId };
+
 			const statusLine =
 				task.status === "running"
 					? `Status: running (${duration})`
@@ -930,6 +940,7 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 					outputLines: output.split("\n").length,
 					outputBytes: task.outputBytes,
 					output,
+					_isConsecutive: isConsecutive,
 				},
 				content: [
 					{
@@ -940,15 +951,8 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 			};
 		},
 
-		renderCall(args, theme) {
-			const taskId = args.taskId as string;
-			const task = tasks.get(taskId);
-			const cmd = task ? truncateCommand(task.command, 40) : "";
-			let text =
-				formatPresentationText(theme, "title", "task_output ") +
-				formatPresentationText(theme, "identity", taskId);
-			if (cmd) text += ` ${formatPresentationText(theme, "meta", cmd)}`;
-			return new Text(text, 0, 0);
+		renderCall(_args, _theme) {
+			return { render: () => [], invalidate: () => {} };
 		},
 
 		renderResult(result, { expanded }, theme) {
@@ -966,10 +970,11 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 						outputBytes?: number;
 						output?: string;
 						error?: boolean;
+						_isConsecutive?: boolean;
 				  }
 				| undefined;
 
-			// Error case — show full text
+			// Error case — always render fully
 			if (details?.error) {
 				const text = result.content[0];
 				return renderLines([
@@ -981,66 +986,107 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 				]);
 			}
 
-			const status = details?.status ?? "unknown";
-			const duration = details?.duration ?? "";
-
-			// Status icon
-			let icon: string;
-			let statusRole: "status_success" | "status_warning" | "status_error";
-			switch (status) {
-				case "running":
-					icon = getIcon("in_progress");
-					statusRole = "status_warning";
-					break;
-				case "completed":
-					icon = getIcon("success");
-					statusRole = "status_success";
-					break;
-				default:
-					icon = getIcon("error");
-					statusRole = "status_error";
+			// Consecutive — collapse to zero height
+			if (details?._isConsecutive) {
+				return { render: () => [], invalidate: () => {} };
 			}
 
-			const lines: string[] = [];
-			appendSection(lines, [
-				formatPresentationText(theme, statusRole, `${icon} ${status}`) +
-					formatPresentationText(theme, "meta", ` (${duration})`),
-			]);
-
-			// Show output tail (always — collapsed=10 lines, expanded=50)
-			if (details?.output) {
-				const allLines = details.output.split("\n").filter((l) => l.length > 0);
-				const maxLines = expanded ? EXPANDED_LINES : COLLAPSED_LINES;
-				const truncated = allLines.length > maxLines;
-				const tail = truncated ? allLines.slice(-maxLines) : allLines;
-
-				appendSection(lines, [formatSectionDivider(theme, "Output")], { blankBefore: true });
-				if (truncated) {
-					appendSection(lines, [
-						formatPresentationText(
-							theme,
-							"meta",
-							`  ... ${allLines.length - maxLines} more lines above`
-						),
-					]);
-				}
-				appendSection(
-					lines,
-					tail.map((line) => `  ${styleBackgroundOutputLine(theme, line)}`)
-				);
-
-				if (!expanded && truncated) {
-					appendSection(lines, [
-						formatPresentationText(theme, "hint", keyHint("expandTools", "to show more")),
-					]);
-				}
-			} else {
-				appendSection(lines, [formatPresentationText(theme, "meta", "(no output yet)")], {
-					blankBefore: true,
+			// Anchor — create poll state entry + return live component
+			const key = `task_output:${details?.taskId}`;
+			if (!pollStates.has(key)) {
+				pollStates.set(key, {
+					taskId: details?.taskId ?? "",
+					latestStatus: details?.status ?? "unknown",
+					latestDuration: details?.duration ?? "",
+					latestExitCode: details?.exitCode ?? null,
+					pollCount: 1,
+					latestOutput: details?.output,
+					latestOutputLines: details?.outputLines,
+					latestOutputBytes: details?.outputBytes,
+					latestCommand: details?.command,
 				});
 			}
 
-			return renderLines(lines, { wrap: expanded });
+			return {
+				render(width: number): string[] {
+					const state = pollStates.get(key);
+					if (!state) return [];
+
+					// Header with taskId and command
+					const header =
+						formatPresentationText(theme, "title", "task_output ") +
+						formatPresentationText(theme, "identity", state.taskId) +
+						(state.latestCommand
+							? ` ${formatPresentationText(theme, "meta", truncateCommand(state.latestCommand, 40))}`
+							: "");
+
+					// Status icon
+					let icon: string;
+					let statusRole: "status_success" | "status_warning" | "status_error";
+					switch (state.latestStatus) {
+						case "running":
+							icon = getIcon("in_progress");
+							statusRole = "status_warning";
+							break;
+						case "completed":
+							icon = getIcon("success");
+							statusRole = "status_success";
+							break;
+						default:
+							icon = getIcon("error");
+							statusRole = "status_error";
+					}
+
+					const pollSuffix =
+						state.pollCount > 1
+							? formatPresentationText(theme, "meta", ` · polled ${state.pollCount}×`)
+							: "";
+					const statusLine =
+						formatPresentationText(theme, statusRole, `${icon} ${state.latestStatus}`) +
+						formatPresentationText(theme, "meta", ` (${state.latestDuration})`) +
+						pollSuffix;
+
+					const lines: string[] = [
+						truncateToWidth(header, width, "…"),
+						truncateToWidth(statusLine, width, "…"),
+					];
+
+					// Output tail
+					if (state.latestOutput) {
+						const allLines = state.latestOutput.split("\n").filter((l) => l.length > 0);
+						const maxLines = expanded ? EXPANDED_LINES : COLLAPSED_LINES;
+						const truncated = allLines.length > maxLines;
+						const tail = truncated ? allLines.slice(-maxLines) : allLines;
+
+						lines.push("");
+						if (truncated) {
+							lines.push(
+								formatPresentationText(
+									theme,
+									"meta",
+									`  ... ${allLines.length - maxLines} more lines above`
+								)
+							);
+						}
+						for (const line of tail) {
+							lines.push(
+								truncateToWidth(`  ${styleBackgroundOutputLine(theme, line)}`, width, "…")
+							);
+						}
+
+						if (!expanded && truncated) {
+							lines.push(
+								formatPresentationText(theme, "hint", keyHint("expandTools", "to show more"))
+							);
+						}
+					} else {
+						lines.push(formatPresentationText(theme, "meta", "(no output yet)"));
+					}
+
+					return lines;
+				},
+				invalidate() {},
+			};
 		},
 	});
 
@@ -1067,7 +1113,24 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 				};
 			}
 
+			const key = `task_status:${params.taskId}`;
+			const isConsecutive =
+				lastCompletedPoll?.toolName === "task_status" &&
+				lastCompletedPoll?.taskId === params.taskId;
+
 			const duration = formatDuration((task.endTime || Date.now()) - task.startTime);
+
+			if (isConsecutive) {
+				const state = pollStates.get(key);
+				if (state) {
+					state.latestStatus = task.status;
+					state.latestDuration = duration;
+					state.latestExitCode = task.exitCode ?? null;
+					state.pollCount++;
+				}
+			}
+
+			lastCompletedPoll = { toolName: "task_status", taskId: params.taskId };
 
 			return {
 				details: {
@@ -1075,6 +1138,7 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 					status: task.status,
 					exitCode: task.exitCode,
 					duration,
+					_isConsecutive: isConsecutive,
 				},
 				content: [
 					{
@@ -1096,19 +1160,23 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 			};
 		},
 
-		renderCall(args, theme) {
-			return new Text(
-				formatPresentationText(theme, "title", "task_status ") +
-					formatPresentationText(theme, "identity", args.taskId as string),
-				0,
-				0
-			);
+		renderCall(_args, _theme) {
+			return { render: () => [], invalidate: () => {} };
 		},
 
 		renderResult(result, _options, theme) {
 			const details = result.details as
-				| { status?: string; duration?: string; error?: boolean }
+				| {
+						taskId?: string;
+						status?: string;
+						duration?: string;
+						exitCode?: number | null;
+						error?: boolean;
+						_isConsecutive?: boolean;
+				  }
 				| undefined;
+
+			// Error results always render fully
 			if (details?.error) {
 				const text = result.content[0];
 				return renderLines([
@@ -1119,24 +1187,58 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 					),
 				]);
 			}
-			const status = details?.status ?? "unknown";
-			const duration = details?.duration ?? "";
-			const icon =
-				status === "running"
-					? getIcon("in_progress")
-					: status === "completed"
-						? getIcon("success")
-						: getIcon("error");
-			const statusRole: "status_success" | "status_warning" | "status_error" =
-				status === "completed"
-					? "status_success"
-					: status === "running"
-						? "status_warning"
-						: "status_error";
-			return renderLines([
-				formatPresentationText(theme, statusRole, `${icon} ${status}`) +
-					formatPresentationText(theme, "meta", ` (${duration})`),
-			]);
+
+			// Consecutive — collapse to zero height
+			if (details?._isConsecutive) {
+				return { render: () => [], invalidate: () => {} };
+			}
+
+			// Anchor — create poll state entry + return live component
+			const key = `task_status:${details?.taskId}`;
+			if (!pollStates.has(key)) {
+				pollStates.set(key, {
+					taskId: details?.taskId ?? "",
+					latestStatus: details?.status ?? "unknown",
+					latestDuration: details?.duration ?? "",
+					latestExitCode: details?.exitCode ?? null,
+					pollCount: 1,
+				});
+			}
+
+			return {
+				render(width: number): string[] {
+					const state = pollStates.get(key);
+					if (!state) return [];
+
+					const header =
+						formatPresentationText(theme, "title", "task_status ") +
+						formatPresentationText(theme, "identity", state.taskId);
+
+					const icon =
+						state.latestStatus === "running"
+							? getIcon("in_progress")
+							: state.latestStatus === "completed"
+								? getIcon("success")
+								: getIcon("error");
+					const statusRole: "status_success" | "status_warning" | "status_error" =
+						state.latestStatus === "completed"
+							? "status_success"
+							: state.latestStatus === "running"
+								? "status_warning"
+								: "status_error";
+					const pollSuffix =
+						state.pollCount > 1
+							? formatPresentationText(theme, "meta", ` · polled ${state.pollCount}×`)
+							: "";
+					const statusLine =
+						formatPresentationText(theme, statusRole, `${icon} ${state.latestStatus}`) +
+						formatPresentationText(theme, "meta", ` (${state.latestDuration})`) +
+						pollSuffix;
+
+					return [truncateToWidth(header, width, "…"), truncateToWidth(statusLine, width, "…")];
+				},
+				invalidate() {},
+			};
 		},
 	});
 
@@ -1186,6 +1288,7 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 			task.output.push("\n[Killed by user]\n");
 
 			syncTaskState(ctx);
+			lastCompletedPoll = null;
 
 			return {
 				details: { taskId: params.taskId, killed: true },
@@ -1615,23 +1718,31 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 		}
 		tasks.clear();
 		promotedAbortControllers.clear();
+		pollStates.clear();
+		lastCompletedPoll = null;
+		backgroundTaskPresenterActive = false;
+		lastWidgetContext = null;
 		publishBackgroundTaskSnapshot(pi.events);
+		interopPresenterStateCleanup?.();
+		interopPresenterStateCleanup = undefined;
 		interopStateRequestCleanup?.();
 		interopStateRequestCleanup = undefined;
 	});
 
-	// Capture TUI reference and update status on session start
+	// Capture TUI reference and initialize on session start
 	pi.on("session_start", async (_event, ctx) => {
-		// Capture TUI via a throwaway widget so Loader can be used in renderResult
+		backgroundTaskPresenterActive = false;
+
+		// Capture TUI via a throwaway widget for requestRender access
 		ctx.ui.setWidget("bg-tasks-tui-capture", (tui, _theme) => {
 			tuiRef = tui;
 			return { render: () => [], invalidate: () => {} };
 		});
-		// Immediately remove — we just needed the reference
 		ctx.ui.setWidget("bg-tasks-tui-capture", undefined);
 
 		ctx.ui.setStatus("bg-tasks", undefined);
 		syncTaskState(ctx);
+		requestInteropState(pi.events, "background-task-tool");
 	});
 
 	// Register Ctrl+Shift+B shortcut for background tasks
@@ -1666,9 +1777,36 @@ export default function backgroundTasksExtension(pi: ExtensionAPI): void {
 		const command = (event.input as Record<string, unknown>).command as string | undefined;
 		if (!command) return;
 
-		return enforceExplicitPolicy(command, "bg_bash", ctx.cwd, ctx.hasUI, (msg) =>
-			ctx.ui.confirm("Shell Policy", msg)
+		const verdict = evaluateCommand(command, "bg_bash", ctx.cwd);
+		const blocked = await enforceExplicitPolicy(
+			command,
+			"bg_bash",
+			ctx.cwd,
+			ctx.hasUI,
+			async (msg, derivedPattern): Promise<ShellConfirmResponse> => {
+				if (derivedPattern) {
+					const options = ["Yes (once)", `Always allow "${derivedPattern}"`, "No"];
+					const choice = await ctx.ui.select("Shell Policy", options);
+					if (choice === options[0]) return "yes";
+					if (choice === options[1]) {
+						ctx.ui.notify(`✅ Added ${derivedPattern} to always-allow rules`, "info");
+						return "always";
+					}
+					return choice === options[2] ? "no" : undefined;
+				}
+				const confirmed = await ctx.ui.confirm("Shell Policy", msg);
+				if (confirmed === true) return "yes";
+				if (confirmed === false) return "no";
+				return undefined;
+			}
 		);
+		if (blocked) {
+			return blocked;
+		}
+
+		if (ctx.hasUI && verdict.allowed && verdict.requiresConfirmation && !isYoloMode()) {
+			ctx.ui.notify("✅ Shell action approved — starting background task", "info");
+		}
 	});
 
 	pi.on("tool_result", async (event, ctx) => {

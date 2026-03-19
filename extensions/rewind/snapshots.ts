@@ -2,9 +2,9 @@
  * Git Snapshot Manager
  *
  * Creates and restores lightweight git ref-based snapshots at conversation
- * turn boundaries. Uses a temporary GIT_INDEX_FILE to capture the full
- * working tree state (tracked + untracked) without touching the user's
- * staging area or polluting the reflog.
+ * turn boundaries. Uses a temporary GIT_INDEX_FILE to capture git's tracked
+ * + unignored working tree view without touching the user's staging area or
+ * polluting the reflog.
  *
  * Snapshot commits are created via `git write-tree` + `git commit-tree`
  * on the temporary index, then stored under a namespaced ref:
@@ -16,9 +16,9 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { unlinkSync } from "node:fs";
+import { copyFileSync, existsSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { runGitCommandSync } from "../_shared/shell-policy.js";
 
 /** Result of restoring a snapshot. */
@@ -31,6 +31,14 @@ export interface RestoreResult {
 	snapshotFileCount: number;
 }
 
+/** Result of creating a turn snapshot. */
+export interface TurnSnapshotResult {
+	/** The ref name for the snapshot. */
+	ref: string;
+	/** True when the snapshot fell back to HEAD because createSnapshot failed. */
+	headFallback: boolean;
+}
+
 /** Metadata for a stored snapshot. */
 export interface SnapshotInfo {
 	turnIndex: number;
@@ -38,10 +46,17 @@ export interface SnapshotInfo {
 	sha: string;
 }
 
+/** Saved real-index state restored after destructive checkout operations. */
+interface GitIndexBackup {
+	backupPath: string;
+	indexPath: string;
+}
+
 /**
  * Manages git ref-based snapshots for rewind functionality.
  *
- * Each snapshot captures the full working tree state at a turn boundary.
+ * Each snapshot captures git's tracked + unignored view of the working tree
+ * at a turn boundary. Ignored files remain outside the snapshot model.
  * Snapshots are stored as lightweight refs that can be restored independently.
  */
 export class SnapshotManager {
@@ -85,7 +100,7 @@ export class SnapshotManager {
 	 * area) is never touched and no reflog entries are created.
 	 *
 	 * Strategy:
-	 * 1. Stage all files (tracked + untracked) into a temp index
+	 * 1. Stage all tracked + unignored files into a temp index
 	 * 2. Write a tree object from that temp index
 	 * 3. Compare against HEAD's tree — bail if identical
 	 * 4. Create a commit from the tree, parented on HEAD
@@ -100,7 +115,8 @@ export class SnapshotManager {
 
 		try {
 			// Stage everything into the temp index (captures untracked files too)
-			this.gitWithEnv(["add", "-A"], { GIT_INDEX_FILE: tmpIndex });
+			const addResult = this.gitWithEnv(["add", "-A"], { GIT_INDEX_FILE: tmpIndex });
+			if (addResult === null) return null;
 
 			// Write a tree object from the temp index
 			const tree = this.gitWithEnv(["write-tree"], { GIT_INDEX_FILE: tmpIndex });
@@ -136,14 +152,59 @@ export class SnapshotManager {
 	}
 
 	/**
+	 * Ensure a turn has a stable rewind ref, even when the working tree matches HEAD.
+	 *
+	 * When no file content changed relative to HEAD, the turn still needs a rewind target.
+	 * In that case, store a namespaced ref that points directly at the current HEAD commit.
+	 *
+	 * @param turnIndex - The conversation turn being snapshotted
+	 * @returns Snapshot result with ref and fallback flag, or null if HEAD cannot be resolved
+	 */
+	createTurnSnapshot(turnIndex: number): TurnSnapshotResult | null {
+		if (!this.hasSnapshotRelevantChanges()) {
+			const headSha = this.git(["rev-parse", "HEAD"]);
+			if (!headSha) return null;
+
+			const ref = `${this.refPrefix}/turn-${turnIndex}`;
+			this.git(["update-ref", ref, headSha]);
+			return { ref, headFallback: false };
+		}
+
+		const createdRef = this.createSnapshot(turnIndex);
+		if (createdRef) return { ref: createdRef, headFallback: false };
+
+		// createSnapshot failed despite relevant changes — fall back to HEAD.
+		// This means the snapshot may not capture uncommitted working tree state.
+		const headSha = this.git(["rev-parse", "HEAD"]);
+		if (!headSha) return null;
+
+		const ref = `${this.refPrefix}/turn-${turnIndex}`;
+		this.git(["update-ref", ref, headSha]);
+		return { ref, headFallback: true };
+	}
+
+	/**
+	 * Check whether the working tree differs from HEAD for rewind purposes.
+	 *
+	 * Uses `git status --porcelain` as a cheap preflight so turns without file
+	 * changes do not pay the cost of a temp-index `git add -A` snapshot.
+	 *
+	 * @returns True when tracked or unignored files changed since HEAD
+	 */
+	private hasSnapshotRelevantChanges(): boolean {
+		const status = this.git(["status", "--porcelain", "--untracked-files=all"]);
+		return status !== null && status.length > 0;
+	}
+
+	/**
 	 * Restores the working tree to the state captured in a snapshot.
 	 *
 	 * Strategy:
 	 * 1. List files in the snapshot tree
-	 * 2. List current working tree files (tracked + untracked)
+	 * 2. List current working tree files (tracked + unignored)
 	 * 3. Checkout all snapshot files from the ref
 	 * 4. Delete files that exist now but didn't exist in the snapshot
-	 * 5. Reset the index to HEAD (checkout stages files it touches)
+	 * 5. Restore the user's original git index so staged work survives rewind
 	 *
 	 * @param ref - The snapshot ref to restore (e.g. refs/tallow/rewind/.../turn-1)
 	 * @returns Detailed restore result
@@ -152,30 +213,33 @@ export class SnapshotManager {
 	restoreSnapshot(ref: string): RestoreResult {
 		const snapshotFiles = this.getSnapshotFiles(ref);
 		const currentFiles = this.getCurrentFiles();
+		const indexBackup = this.backupGitIndex();
 
 		// Files to delete: exist now but not in snapshot
 		const snapshotSet = new Set(snapshotFiles);
 		const filesToDelete = currentFiles.filter((f) => !snapshotSet.has(f));
 
-		// Restore all files from the snapshot commit's tree
-		if (snapshotFiles.length > 0) {
-			this.git(["checkout", ref, "--", "."]);
-		}
-
-		// Delete files that were created after the snapshot.
-		// Use fs.unlinkSync for reliability — git rm only works for tracked files.
-		for (const file of filesToDelete) {
-			try {
-				unlinkSync(join(this.repoRoot, file));
-			} catch {
-				// File might already be gone — best effort
+		try {
+			// Restore all files from the snapshot commit's tree
+			if (snapshotFiles.length > 0) {
+				const checkoutResult = this.git(["checkout", ref, "--", "."]);
+				if (checkoutResult === null) {
+					throw new Error(`git checkout failed for ref ${ref} — files were not restored`);
+				}
 			}
-		}
 
-		// Clean the index — `git checkout ref -- .` stages everything it touches.
-		// This is intentional (we just replaced the working tree), so the staging
-		// area reset is expected here.
-		this.git(["reset", "HEAD", "--quiet"]);
+			// Delete files that were created after the snapshot.
+			// Use fs.unlinkSync for reliability — git rm only works for tracked files.
+			for (const file of filesToDelete) {
+				try {
+					unlinkSync(join(this.repoRoot, file));
+				} catch {
+					// File might already be gone — best effort
+				}
+			}
+		} finally {
+			this.restoreGitIndex(indexBackup);
+		}
 
 		return {
 			restored: snapshotFiles,
@@ -237,7 +301,7 @@ export class SnapshotManager {
 	}
 
 	/**
-	 * Gets all current files in the working tree (tracked + untracked).
+	 * Gets all current files in the working tree (tracked + unignored).
 	 *
 	 * @returns Array of file paths relative to the repo root
 	 */
@@ -255,6 +319,50 @@ export class SnapshotManager {
 		}
 
 		return [...files];
+	}
+
+	/**
+	 * Resolve the real git index path for the current repository/worktree.
+	 *
+	 * @returns Absolute path to the live git index, or null when unavailable
+	 */
+	private resolveGitIndexPath(): string | null {
+		const indexPath = this.git(["rev-parse", "--git-path", "index"]);
+		if (!indexPath) return null;
+		return isAbsolute(indexPath) ? indexPath : resolve(this.repoRoot, indexPath);
+	}
+
+	/**
+	 * Save the current git index so restore operations can put it back unchanged.
+	 *
+	 * @returns Backup metadata, or null when the index cannot be backed up
+	 */
+	private backupGitIndex(): GitIndexBackup | null {
+		const indexPath = this.resolveGitIndexPath();
+		if (!indexPath || !existsSync(indexPath)) return null;
+
+		const backupPath = join(tmpdir(), `tallow-index-backup-${process.pid}-${randomUUID()}`);
+		copyFileSync(indexPath, backupPath);
+		return { backupPath, indexPath };
+	}
+
+	/**
+	 * Restore a previously saved git index backup and remove the temp copy.
+	 *
+	 * @param backup - Backup metadata returned by {@link backupGitIndex}
+	 * @returns void
+	 */
+	private restoreGitIndex(backup: GitIndexBackup | null): void {
+		if (!backup) return;
+		try {
+			copyFileSync(backup.backupPath, backup.indexPath);
+		} finally {
+			try {
+				unlinkSync(backup.backupPath);
+			} catch {
+				// Best-effort temp cleanup only.
+			}
+		}
 	}
 
 	/**
@@ -288,6 +396,6 @@ export class SnapshotManager {
 		});
 
 		if (result.error || result.status !== 0) return null;
-		return (result.stdout ?? "").toString().trim() || null;
+		return (result.stdout ?? "").toString().trim();
 	}
 }

@@ -1356,7 +1356,7 @@ export function loadPermissionConfig(
 	const sources: PermissionSource[] = [];
 	const home = homedir();
 	const tallowHome = process.env.PI_CODING_AGENT_DIR ?? join(home, ".tallow");
-	const allowProjectSettings = isProjectTrusted();
+	const allowProjectSettings = isProjectTrusted(cwd);
 
 	// CLI tier
 	if (
@@ -1379,12 +1379,14 @@ export function loadPermissionConfig(
 	}
 
 	// Claude local: .claude/settings.local.json (same precedence tier as project-local)
-	const claudeLocalPath = join(cwd, ".claude", "settings.local.json");
-	const claudeLocalRaw = readPermissionsFromFile(claudeLocalPath, warnings);
-	if (claudeLocalRaw) {
-		const parsedConfig = parsePermissionsObject(claudeLocalRaw, warnings);
-		const config = annotateConfigSource(parsedConfig, claudeLocalPath, "project-local");
-		sources.push({ path: claudeLocalPath, tier: "project-local", config });
+	if (allowProjectSettings) {
+		const claudeLocalPath = join(cwd, ".claude", "settings.local.json");
+		const claudeLocalRaw = readPermissionsFromFile(claudeLocalPath, warnings);
+		if (claudeLocalRaw) {
+			const parsedConfig = parsePermissionsObject(claudeLocalRaw, warnings);
+			const config = annotateConfigSource(parsedConfig, claudeLocalPath, "project-local");
+			sources.push({ path: claudeLocalPath, tier: "project-local", config });
+		}
 	}
 
 	// Project shared: .tallow/settings.json
@@ -1399,12 +1401,14 @@ export function loadPermissionConfig(
 	}
 
 	// Claude shared: .claude/settings.json (same tier as project-shared)
-	const claudeSharedPath = join(cwd, ".claude", "settings.json");
-	const claudeSharedRaw = readPermissionsFromFile(claudeSharedPath, warnings);
-	if (claudeSharedRaw) {
-		const parsedConfig = parsePermissionsObject(claudeSharedRaw, warnings);
-		const config = annotateConfigSource(parsedConfig, claudeSharedPath, "project-shared");
-		sources.push({ path: claudeSharedPath, tier: "project-shared", config });
+	if (allowProjectSettings) {
+		const claudeSharedPath = join(cwd, ".claude", "settings.json");
+		const claudeSharedRaw = readPermissionsFromFile(claudeSharedPath, warnings);
+		if (claudeSharedRaw) {
+			const parsedConfig = parsePermissionsObject(claudeSharedRaw, warnings);
+			const config = annotateConfigSource(parsedConfig, claudeSharedPath, "project-shared");
+			sources.push({ path: claudeSharedPath, tier: "project-shared", config });
+		}
 	}
 
 	// User: ~/.tallow/settings.json

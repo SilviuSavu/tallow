@@ -5,6 +5,407 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.25](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.24...tallow-v0.8.25) (2026-03-18)
+
+
+### Fixed
+
+* **ci:** resolve workspace:* references before npm publish ([1bc8bdb](https://github.com/dungle-scrubs/tallow/commit/1bc8bdb0ad25e2d725bec5a67ac3303e590601e8))
+* **skill-commands:** register slash commands for sharedSkillsDirs skills ([905e3b7](https://github.com/dungle-scrubs/tallow/commit/905e3b752954298198eac8d1bb5cb94aa0f8096c))
+
+
+### Documentation
+
+* changelog entries for skill-commands fix and tui sync ([999fe8e](https://github.com/dungle-scrubs/tallow/commit/999fe8e48e252ebb0e430da6dfdcf3ca0796ce09))
+
+
+### Maintenance
+
+* remove dead plan-rejection-feedback tests ([c65670f](https://github.com/dungle-scrubs/tallow/commit/c65670fd6cf17450198776be1c5c487598cfe19e))
+* **tui:** sync forked pi-tui to upstream v0.60.0 ([4f44580](https://github.com/dungle-scrubs/tallow/commit/4f445801a16a8653e92ff565283ccbca9f1c5534))
+
+## [Unreleased]
+
+### Added
+
+- **sdk:** `sharedSkillsDirs` global setting — load skills from cross-app
+  directories (e.g. `~/.skills`) shared between tallow and other tools.
+  Paths must be absolute or `~/`-prefixed; project settings cannot override.
+  Non-existent directories are silently skipped
+- **otel:** opt-in OpenTelemetry distributed tracing via `telemetry` option
+  in `TallowSessionOptions`. Emits `tallow.*` spans for session lifecycle,
+  prompt turns, tool calls, and model invocations. All span attributes are
+  metadata-only — no prompt text, tool payloads, or secrets are captured.
+  Zero-cost no-op when disabled
+- **otel:** W3C `traceparent`/`tracestate` propagation through CLI env and
+  subagent child processes for cross-process trace continuity
+- **otel:** safe attribute builders (`sessionAttributes`, `promptAttributes`,
+  `modelAttributes`, `toolAttributes`, `subagentAttributes`,
+  `teammateAttributes`) with CWD hashing and redaction guarantees
+- **otel:** event bus telemetry handle sharing so extensions can access trace
+  context without direct coupling
+- **loop:** `/loop` command — run a prompt or slash command on a recurring
+  interval (e.g. `/loop 5m check deploy`). Uses post-completion delay to
+  prevent overlapping runs, with live countdown in the status bar
+- **shell-policy:** "Always Allow" option for high-risk shell command
+  confirmations — persists `Bash(pattern)` rules to
+  `~/.tallow/settings.json` so matching commands skip confirmation in
+  future sessions
+
+### Changed
+
+- **tui:** sync forked pi-tui to upstream v0.60.0 — adds tmux xterm
+  `modifyOtherKeys` matching for Backspace, Escape, and Space, and
+  resolves raw `\x08` backspace ambiguity with Windows Terminal heuristic
+- **install:** use `@dungle-scrubs/tallow` as the canonical published package
+  name in installer guidance and upgrade commands
+- **tui:** global select cursor changed from → to ↗
+
+### Fixed
+
+- **skill-commands:** register `/slash-commands` for skills loaded from
+  `sharedSkillsDirs` (e.g. `~/dev/skills`). Previously only `.claude/skills/`
+  paths were scanned, so shared skills appeared in the system prompt but had
+  no corresponding slash command
+- **hooks:** don't block input when workspace directory is renamed or deleted
+  externally — infrastructure errors (missing cwd, spawn failures) are now
+  distinguished from policy blocks and never freeze the session
+- **packaging:** make the published tarball self-contained by switching
+  bundled extensions off repo-only `src/` imports, including the local
+  `packages/tallow-tui` workspace in the packlist, and degrading prompt
+  suggestions safely when ghost-text editor support is unavailable
+- **slash-command-bridge:** move model-invoked `/compact` deferral to the
+  proven post-response `turn_end` boundary, add deterministic lifecycle
+  regression coverage, and stop stale `agent_end` races from dropping
+  compaction or resumption
+- **background-task-tool,tasks:** suppress the duplicate live background-task
+  widget when the shared tasks dashboard is active, keeping `Background Tasks`
+  as the single surface and stopping above-editor row jitter
+- **tui:** fix streaming ghost empty spaces caused by stale `maxLinesRendered`
+  high-water mark, missing `extraLines > height` safety guard in the diff
+  cleanup path, and viewport drift correction firing one render cycle late
+- **rewind:** windowed turn selector using `ctx.ui.custom()` — `/rewind`
+  with 35+ turns no longer overflows the terminal viewport. The list is
+  now windowed with scroll indicators and keyboard navigation wrapping
+- **health:** show runtime provenance for the active CLI, including
+  install mode, build freshness, executable path, and resolved package
+  path
+- **startup:** auto-rebuild stale linked/source-checkout `dist/` output on
+  CLI launch before restarting into the fresh build
+- **trust:** migrate legacy project trust entries so previously trusted
+  folders do not false-positive as stale after trust fingerprint upgrades
+- **workspace-transition:** use Windows named pipes for the child-process relay
+  and degrade gracefully when relay startup is unavailable
+- **subagent:** use `--model` instead of `--models` for forked subprocesses
+- **teams-tool:** use tallow auth and model config in team spawns
+
+### Documentation
+
+- **docs:** align README/docs agent-template counts, bundled template lists,
+  and `/agent:<name>` invocation examples with shipped templates
+- **docs:** rename the homepage extension section to featured extensions and
+  refresh docs metadata counts
+- **context-fork:** document the correct `--model` subprocess flag
+
+### Maintenance
+
+- **deps:** bump pi-* dependencies
+- **tests:** exclude `_defaults.md` from agent-template drift counts and verify
+  scoped package links plus key docs metadata
+
+## [0.8.24](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.23...tallow-v0.8.24) (2026-03-18)
+
+
+### Added
+
+* **tui:** add requestScrollbackClear() for session-level resets ([ecf4559](https://github.com/dungle-scrubs/tallow/commit/ecf4559f9b66abe24f9575a33344097eb0c4fe36))
+
+
+### Fixed
+
+* **hooks:** don't block input when cwd is renamed or deleted ([feba24d](https://github.com/dungle-scrubs/tallow/commit/feba24d9987ed7c30afd3a520176761ebc7d2a52))
+* **packaging:** bundle forked pi-tui for npm consumers ([64a996c](https://github.com/dungle-scrubs/tallow/commit/64a996cdd804104f09879b6fd0ee5f011531b8c0))
+* **plan-mode:** remove execution tracking that caused infinite loop ([d3cccad](https://github.com/dungle-scrubs/tallow/commit/d3cccad23a6ab3bb4833e7b1d46de6618db44b18))
+* **shell-policy:** remove rm -r from high-risk confirmation prompts ([40c3e01](https://github.com/dungle-scrubs/tallow/commit/40c3e016c859f5bc5091c2d1b206678ddced02ce))
+* **workspace-transition:** clear scrollback on session swap ([19560f7](https://github.com/dungle-scrubs/tallow/commit/19560f741c4c7743efe9f9ec7ea4523ad700406f))
+
+
+### Changed
+
+* bump pi framework to 0.58.3, update transitive deps ([3d65c7d](https://github.com/dungle-scrubs/tallow/commit/3d65c7dd93ad0ad4c7a2a66cd38eb71f561214d6))
+
+
+### Documentation
+
+* move [Unreleased] above latest release, add hooks fix entry ([cf95d36](https://github.com/dungle-scrubs/tallow/commit/cf95d364153879095787587175ff137745760439))
+
+
+### Maintenance
+
+* **deps:** bump pi-* dependencies ([26cb037](https://github.com/dungle-scrubs/tallow/commit/26cb03780fb4cf3e3b3977bacfb65a08e1c21e08))
+* **hooks:** add stale-cwd unit tests ([6aef56d](https://github.com/dungle-scrubs/tallow/commit/6aef56d64af954644ef392de8e6c8e18a9eb03c8))
+
+## [0.8.23](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.22...tallow-v0.8.23) (2026-03-15)
+
+
+### Added
+
+* **loop:** add max iterations (x&lt;N&gt;) and stop conditions (until) ([d56866e](https://github.com/dungle-scrubs/tallow/commit/d56866ebb3822b8b8791e7ecbe4c3e24b4738753))
+* **plan-mode:** render plan steps in bordered widget ([64b9ad9](https://github.com/dungle-scrubs/tallow/commit/64b9ad90ce319b3a43595ac14f450d390ed3034a))
+* **slash-command-bridge:** show compact progress as inline widget instead of footer status ([d43ec56](https://github.com/dungle-scrubs/tallow/commit/d43ec56743136a2b7cccc9c0a7322b9f48ec56f3))
+
+
+### Fixed
+
+* **extensions:** harden packaged ui runtime ([a319a87](https://github.com/dungle-scrubs/tallow/commit/a319a87052847e6c8cad22ca15938bfae6d8e806))
+* **packaging:** add publish-safe runtime bridges ([3346f75](https://github.com/dungle-scrubs/tallow/commit/3346f7550cc9d2c659b36fcc907cd92d66ccf423))
+* **packaging:** ship published runtime dependencies ([966e218](https://github.com/dungle-scrubs/tallow/commit/966e218618b0e51a603e99452cb2b6669baff389))
+* **plan-mode:** show action menu when execution ends with incomplete steps ([55b3820](https://github.com/dungle-scrubs/tallow/commit/55b3820a7ddd2c2a837753d3ce46f76570dd4335))
+* **slash-command-bridge:** repair model-invoked compact lifecycle ([e93923e](https://github.com/dungle-scrubs/tallow/commit/e93923e99dc4dfe2887bbe59bdad10e2cc787d73))
+* **tasks:** suppress duplicate background task widget ([28609d4](https://github.com/dungle-scrubs/tallow/commit/28609d40d212d9436f410dc1b416c28f461c79c7))
+* **teams:** deliver messages to working teammates via followUp ([1215bb5](https://github.com/dungle-scrubs/tallow/commit/1215bb5a257b4a2720ce31ca1466843bd28acbd7))
+* **tui:** prevent differential rendering ghosting on content shrink ([87b7529](https://github.com/dungle-scrubs/tallow/commit/87b7529ce4ee667adaaf1c9e79fedbc45721b700))
+* **tui:** resolve streaming ghost empty spaces between content and bottom UI ([5c0ec0b](https://github.com/dungle-scrubs/tallow/commit/5c0ec0bb22add9782850124a66bb92204c9f0247))
+* **wezterm:** remove TTY exception and add tool_call guardrail hook ([7fde09d](https://github.com/dungle-scrubs/tallow/commit/7fde09d7aa0de47ddb1f56069fe84806f51fce45))
+* **workspace-transition:** support Windows relay pipes ([bfcf25f](https://github.com/dungle-scrubs/tallow/commit/bfcf25f94103a773927a996a916681afa749b63e))
+
+
+### Documentation
+
+* add changelog entry for streaming ghost gap fix ([cb69101](https://github.com/dungle-scrubs/tallow/commit/cb69101d67a29842e8a4075aa71de5a68a711831))
+
+
+### Maintenance
+
+* **cli:** relax spawned process timeouts ([50b7cab](https://github.com/dungle-scrubs/tallow/commit/50b7cab31546bfb68ee9761351afa6e35bf3d1b1))
+* **deps:** bump pi-* dependencies ([34af276](https://github.com/dungle-scrubs/tallow/commit/34af27670fce4e50aa6d65ade08ee19600337daa))
+* **packaging:** cover packed tarball runtime ([c508157](https://github.com/dungle-scrubs/tallow/commit/c508157502455caea201cdd61444227095cd9eae))
+* **slash-command-bridge:** update compact tests for widget-based progress ([c884e35](https://github.com/dungle-scrubs/tallow/commit/c884e355c4e09eeefcdeb72b29bbc68015b92c39))
+* **teams:** update peer-messaging tests for working-teammate delivery ([717e465](https://github.com/dungle-scrubs/tallow/commit/717e465e1130250864a391ad8a2ed4c8d23e32f4))
+* **tui:** add regression tests for shrink ghosting fixes ([93ffc90](https://github.com/dungle-scrubs/tallow/commit/93ffc9013c143ce32a135e36b429414340e3ccda))
+* **tui:** add regression tests for streaming ghost gap fixes ([9c65b20](https://github.com/dungle-scrubs/tallow/commit/9c65b20449128091462cd5a97cd69ae3fc8a3f7d))
+* **wezterm:** add guardrail helper unit tests ([cf03acb](https://github.com/dungle-scrubs/tallow/commit/cf03acb5b3908cb8a58bc1407616e4819ace8d93))
+
+## [0.8.22](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.21...tallow-v0.8.22) (2026-03-10)
+
+
+### Added
+
+* **background-task-tool:** make bg_bash always non-blocking with bottom widget ([d51c5c1](https://github.com/dungle-scrubs/tallow/commit/d51c5c14c28eb48d38cfb67d63641293a633810f))
+* **cli:** add --system-prompt and --append-system-prompt flags ([85ec58e](https://github.com/dungle-scrubs/tallow/commit/85ec58e01705d258acf303bb93e72a7cb99395df))
+* **sdk:** add sharedSkillsDirs setting for cross-app skill sharing ([dd8e451](https://github.com/dungle-scrubs/tallow/commit/dd8e451374c7fa40bd68b0a25ddf4cef3baf0427))
+
+
+### Fixed
+
+* **bash-tool-enhanced:** remove setWorkingMessage dual-rendering ([0cd3d84](https://github.com/dungle-scrubs/tallow/commit/0cd3d84cde85ff3dddde60865a335de9919e8c36))
+* **hooks:** translate Claude event names in package and extension hooks ([6966820](https://github.com/dungle-scrubs/tallow/commit/6966820b69b2e2c23c0ceb8bd155e458e9e66b32))
+* **wezterm-pane-control:** rewrite pane guidance to bg_bash-first policy ([bdd502c](https://github.com/dungle-scrubs/tallow/commit/bdd502c6b71adf657b751edf7e15de00407a1067))
+
+
+### Maintenance
+
+* **background-task-tool:** update lifecycle tests for always-async bg_bash ([f4d541c](https://github.com/dungle-scrubs/tallow/commit/f4d541c881770ba90e4ebd2b50c1f8d2b99200a6))
+* **deps:** bump pi-* dependencies ([84219ac](https://github.com/dungle-scrubs/tallow/commit/84219accc95ea78257e0dd45a32c468e9a31f04b))
+* **wezterm-pane-control:** update guidance assertions for bg_bash-first policy ([1d04d16](https://github.com/dungle-scrubs/tallow/commit/1d04d16dd370465238f82066e110b574f1c119aa))
+
+## [0.8.21](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.20...tallow-v0.8.21) (2026-03-09)
+
+
+### Added
+
+* **core:** add runtime-adaptive yield-to-io utility ([db796da](https://github.com/dungle-scrubs/tallow/commit/db796da423ad520ae401bc7246ee39d863c186b3))
+* **loop:** add /loop command for recurring prompt execution ([4b2e55a](https://github.com/dungle-scrubs/tallow/commit/4b2e55a544d2350535fa56f97706517607fcee96))
+* **otel:** opt-in OpenTelemetry distributed tracing for SDK consumers ([d5aab28](https://github.com/dungle-scrubs/tallow/commit/d5aab28088c7451d0f5db8cdaa45b9dc2376db86))
+
+
+### Fixed
+
+* **cli:** enforce explicit tool allowlists and stabilize integration checks ([a0e25df](https://github.com/dungle-scrubs/tallow/commit/a0e25dfae98f01b54b4ca451d6f09cf16feeb01c))
+* **core:** honor session cwd across tool wrappers ([afd6750](https://github.com/dungle-scrubs/tallow/commit/afd6750918fe8aa973bd66bdf1f2e6fafbeb89fd))
+* **health:** show runtime provenance for active cli ([5addf94](https://github.com/dungle-scrubs/tallow/commit/5addf94c69246e6f17062d3d5264d79d0cd05635))
+* **rewind:** narrow rollback claims to tracked files ([7f0dcbd](https://github.com/dungle-scrubs/tallow/commit/7f0dcbda98b9f4ba9680992b7919d64be6d9377e))
+* **rewind:** preserve staged work, skip clean turns, and windowed turn selector ([887ee6a](https://github.com/dungle-scrubs/tallow/commit/887ee6a5f2eeedddd30e3e4ed32631b0fd65a24b))
+* **session-memory:** scope recall to current project by default ([02b08a7](https://github.com/dungle-scrubs/tallow/commit/02b08a7eab51a6baed5385898d351e6f38363e2d))
+* **shell-policy:** use exact command in "Always allow" rules instead of wildcards ([fb225be](https://github.com/dungle-scrubs/tallow/commit/fb225bee48fe976de3c6d06ba31a48221e1631d1))
+* **startup:** auto-rebuild stale local dist launches ([5843e74](https://github.com/dungle-scrubs/tallow/commit/5843e74fe5012324c4635d1c9b87de730a95f042))
+* **streaming:** replace setImmediate with yield-to-io in patches ([fd35af4](https://github.com/dungle-scrubs/tallow/commit/fd35af4fe7c7144d40ad8b14615489e8a3498f26))
+* **subagent:** use --model instead of --models in subprocess args ([f3de491](https://github.com/dungle-scrubs/tallow/commit/f3de49182987d04061dd5ca2cfcba79783ece5a9))
+* **trust:** gate project-controlled prompt surfaces ([cb14242](https://github.com/dungle-scrubs/tallow/commit/cb142429b3d5518b0032ed78726d07a90686fb05))
+* **trust:** migrate legacy project approvals ([e6ac776](https://github.com/dungle-scrubs/tallow/commit/e6ac776e21274028b4ffe636f8259b0be1b449ae))
+* **tui:** replace setImmediate with setTimeout(0) in scheduleRender ([5b336ac](https://github.com/dungle-scrubs/tallow/commit/5b336ac140418f637587e0cd8a9f661ecd3a2435))
+* use @dungle-scrubs/tallow in install docs and revert dual-publish ([4e43ee0](https://github.com/dungle-scrubs/tallow/commit/4e43ee09a24be787cfb4a703622996078acd9295))
+* **web-fetch:** block private network targets ([64863d7](https://github.com/dungle-scrubs/tallow/commit/64863d73d51cec4bcab2dd5815a191b2afee9d1a))
+* **web-fetch:** pin direct requests and record redirect telemetry ([4eec297](https://github.com/dungle-scrubs/tallow/commit/4eec2975b9c5d6dc957a94166e544b9f45a43474))
+* **web-fetch:** require explicit opt-in for scraper fallback ([b723144](https://github.com/dungle-scrubs/tallow/commit/b723144c84c1955f9dd7bae41bb0b18fff30e965))
+* **web-fetch:** stop buffering entire responses ([bdaa305](https://github.com/dungle-scrubs/tallow/commit/bdaa305da44fb3576b61daf98ede70a2ed464852))
+
+
+### Documentation
+
+* fix docs and changelog drift ([a52932a](https://github.com/dungle-scrubs/tallow/commit/a52932ac914d6a6fc56e8333961fdb45a27de81a))
+* **installation:** use bun global install commands ([18b8a40](https://github.com/dungle-scrubs/tallow/commit/18b8a4012b557f2c485815dec05318a84c627605))
+* **loop:** add extension docs page and update counts (51→52) ([b77d719](https://github.com/dungle-scrubs/tallow/commit/b77d719f3c6fdc7c05f38e0327bcbadd8738cf2e))
+
+
+### Maintenance
+
+* add docs and changelog validation scripts ([17d88f8](https://github.com/dungle-scrubs/tallow/commit/17d88f827002a40ed36fc3355c086f8beaea5d7b))
+* **context-budget:** tolerate first-call planner race ([ec7a2a5](https://github.com/dungle-scrubs/tallow/commit/ec7a2a58464400e7087550a4c9e62657a36298f9))
+* **deps:** bump pi-* dependencies ([6fb8200](https://github.com/dungle-scrubs/tallow/commit/6fb8200a39f9b0d32bf73412699d6f4644de169a))
+* **installer:** align upgrade guidance expectations ([4e31abe](https://github.com/dungle-scrubs/tallow/commit/4e31abe5ce94dc726a139a95bfe2f059e7ab3202))
+* **loop:** add unit tests for interval parsing, countdown, and args ([b5c1eb2](https://github.com/dungle-scrubs/tallow/commit/b5c1eb2317658f37e47014ed953909e39fdbc38b))
+* run docs validation checks in review workflows ([7882dd1](https://github.com/dungle-scrubs/tallow/commit/7882dd1e40d1f11abed498f78651c91fa11aaee9))
+* **shell-policy:** update tests for exact-command allow patterns ([39b3be0](https://github.com/dungle-scrubs/tallow/commit/39b3be0aefa2963ec1661ad0bcc3a92933e43cbd))
+
+## [0.8.20](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.19...tallow-v0.8.20) (2026-03-08)
+
+
+### Fixed
+
+* **streaming:** coalesce message_update events in handleEvent ([013eb1b](https://github.com/dungle-scrubs/tallow/commit/013eb1b9460b403faea94661b307ae37108d4ada))
+* **streaming:** yield to I/O during EventStream iteration ([04a010f](https://github.com/dungle-scrubs/tallow/commit/04a010f9bad2e6be94881b06814aabdf7ab29e10))
+
+
+### Documentation
+
+* remove npx/bunx install instructions ([a26d670](https://github.com/dungle-scrubs/tallow/commit/a26d670da5f63154861568aa93f5aa276064baad))
+
+
+### Maintenance
+
+* dual-publish to both tallow and @dungle-scrubs/tallow ([8cc4d6d](https://github.com/dungle-scrubs/tallow/commit/8cc4d6dd5f1792f8671b3bf9b2aa18481768b7fe))
+
+## [0.8.19](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.18...tallow-v0.8.19) (2026-03-07)
+
+
+### Added
+
+* **bash-tool:** use 3-option select for high-risk confirmations ([0229aa1](https://github.com/dungle-scrubs/tallow/commit/0229aa136382e164ef3abb4b539fc15135c2bb3b))
+* **shell-policy:** add always-allow option for high-risk commands ([1780aa4](https://github.com/dungle-scrubs/tallow/commit/1780aa4f9f3479c6020880f96ee9a0c7de73ad7c))
+* **workspace-transition:** add Unix-socket relay for child-process cd ([97f6a68](https://github.com/dungle-scrubs/tallow/commit/97f6a6811467f0c98bf24b61c078570b5f02b651))
+
+
+### Fixed
+
+* **cd-tool:** use ctx.cwd for path resolution and remap worktree paths ([7dfd7ea](https://github.com/dungle-scrubs/tallow/commit/7dfd7ea68a47b9391ee1b9d27ddf0bb6b0e6d86b))
+* **teams-tool:** use tallow auth and model config in team spawns ([0f08485](https://github.com/dungle-scrubs/tallow/commit/0f0848526e465ff9f7d0f0096bf86a12932ac7e4))
+
+
+### Documentation
+
+* add missing changelog entries for 0.8.19 ([f0ea4a1](https://github.com/dungle-scrubs/tallow/commit/f0ea4a18f2754c201505986254aba93851f2fa57))
+
+
+### Maintenance
+
+* **shell-policy:** add always-allow tests and update callers ([19d66d2](https://github.com/dungle-scrubs/tallow/commit/19d66d22433d87232399516ac4c1b9f263309879))
+* **teams-tool:** add spawn auth path resolution tests ([5ae804e](https://github.com/dungle-scrubs/tallow/commit/5ae804ea57832279421f60701fe21f2517575016))
+
+## [0.8.18](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.17...tallow-v0.8.18) (2026-03-07)
+
+
+### Maintenance
+
+* **deps:** bump pi-* dependencies ([742f98c](https://github.com/dungle-scrubs/tallow/commit/742f98c93ff29531645a580cf2c8b086b6c47543))
+
+## [0.8.17](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.16...tallow-v0.8.17) (2026-03-07)
+
+
+### Added
+
+* **context-files:** add path-scoped rule activation ([63dd5b7](https://github.com/dungle-scrubs/tallow/commit/63dd5b711bdee85531a623d011badd4c5754a3ad))
+* **web-fetch-tool:** add dendrite fallback ([5129c48](https://github.com/dungle-scrubs/tallow/commit/5129c48584a939cdc17eac4fe20f2792ee9efb20))
+* **wezterm:** intelligent pane use for TTY commands and secret privacy ([50971c8](https://github.com/dungle-scrubs/tallow/commit/50971c8d50b549b3fe61e1ff0a959561372ce413))
+* **workspace-transition:** finish Plan B cd transitions ([87969d7](https://github.com/dungle-scrubs/tallow/commit/87969d75cf55b530aeb53b504a3e6706bebaef94))
+
+
+### Fixed
+
+* **context:** treat unknown usage as unavailable ([b0e70d2](https://github.com/dungle-scrubs/tallow/commit/b0e70d29941bde5b5b115e7e4e74a49f6a5aa4d5))
+* **installer:** stop claiming binary self-upgrades ([6a818f4](https://github.com/dungle-scrubs/tallow/commit/6a818f46ac19331a85de538341552126cbe0e5bd))
+* **interactive:** surface overflow and compaction retry failures ([11dfbd7](https://github.com/dungle-scrubs/tallow/commit/11dfbd756ab11374df356a0218e49bfd4f1bcb91))
+* **sdk:** abort compaction before session resets ([b89238b](https://github.com/dungle-scrubs/tallow/commit/b89238b0561200e65d43a8e8249839e03871d29d))
+* **slash-command-bridge:** add live compact heartbeat progress ([d2b0100](https://github.com/dungle-scrubs/tallow/commit/d2b010062dafccc3de09f513a50b14a4cd5d6d35))
+* **tui:** yield render scheduling during streaming ([6e074bf](https://github.com/dungle-scrubs/tallow/commit/6e074bfb10dd2ab96a539fcbdf667cd6d79518ac))
+* **wezterm:** unescape send_text and use --no-paste for execution ([994e5bc](https://github.com/dungle-scrubs/tallow/commit/994e5bcdc2b3ae5e8f3ed787cb49b8eed26bd1a2))
+
+
+### Changed
+
+* **background-task-tool:** collapse consecutive poll calls in-place ([a9a662f](https://github.com/dungle-scrubs/tallow/commit/a9a662fef99656a9a43ebf984bde65ad7599423c))
+* **core:** harden trust-scoped workspace plumbing ([5292d63](https://github.com/dungle-scrubs/tallow/commit/5292d634390764040c8c01ac3fe174f57739f080))
+
+
+### Documentation
+
+* **changelog:** add scoped-rules release note ([806df99](https://github.com/dungle-scrubs/tallow/commit/806df9954d4438adb46afe3c0dd7a4a07cbede4d))
+* **changelog:** note compact heartbeat progress feedback ([ba4248d](https://github.com/dungle-scrubs/tallow/commit/ba4248dbb48ed452438ce9a9e11dfabc016943e1))
+* **changelog:** note streaming input scheduling fix ([e070755](https://github.com/dungle-scrubs/tallow/commit/e0707552e92b4bca4710e73ba820e9bd96a965c2))
+* **context-files:** document scoped rule compatibility ([97abd74](https://github.com/dungle-scrubs/tallow/commit/97abd7488a7df1e0d1f70ff94b8b119f3d8dd1d5))
+* **context:** document unknown-usage no-data behavior ([c954833](https://github.com/dungle-scrubs/tallow/commit/c954833567519a29e56f2ca9937659772d635b39))
+* **installation:** clarify installer upgrade flows ([97db4df](https://github.com/dungle-scrubs/tallow/commit/97db4df234ec75d9ab107a350a36a6d9a3e42039))
+* **web-fetch-tool:** document dendrite fallback ([608e672](https://github.com/dungle-scrubs/tallow/commit/608e672b64efd93647c5367beacd564707a9d553))
+
+
+### Maintenance
+
+* **background-task-tool:** add consecutive poll detection tests ([8910af9](https://github.com/dungle-scrubs/tallow/commit/8910af91299d19273df3eb6ec53ee9ec8b4191b2))
+* **skills:** refresh tallow-expert reference ([f1ec89a](https://github.com/dungle-scrubs/tallow/commit/f1ec89ab70d4d7e51f37d45843ecbe9f41353342))
+* **workspace-transition:** cover host orchestration ([8a773cc](https://github.com/dungle-scrubs/tallow/commit/8a773cc80e7f7640fc33fc38c5bf6635dfc77301))
+
+## [0.8.16](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.15...tallow-v0.8.16) (2026-03-05)
+
+
+### Fixed
+
+* **tui:** guard image width math in narrow panes ([4b8f9a0](https://github.com/dungle-scrubs/tallow/commit/4b8f9a030aa9ab8af5aab82d0c218c162dcaf5d2))
+* **tui:** improve terminal image layout quantization ([81fbc27](https://github.com/dungle-scrubs/tallow/commit/81fbc2785fb13b69fc309301cbedf4a22920ceb0))
+
+
+### Maintenance
+
+* **context-budget:** tolerate planner-unavailable fallback batch sizes ([b2479f4](https://github.com/dungle-scrubs/tallow/commit/b2479f45392e223cf5019c28ef95b88f49ba61a7))
+* **deps:** bump pi-* dependencies ([3b19fa0](https://github.com/dungle-scrubs/tallow/commit/3b19fa088328329b28b7439e2a3c0100867f0285))
+* **runner:** serialize prompt execution across integration sessions ([08d77a8](https://github.com/dungle-scrubs/tallow/commit/08d77a8604d6c51ef7c6ca05c314712d25484c68))
+* **runner:** serialize TALLOW_HOME mutation across concurrent sessions ([7cdfb65](https://github.com/dungle-scrubs/tallow/commit/7cdfb6507b73b616384a015047aeba8fbb450385))
+* **runner:** wait for session_start handlers before first prompt ([1fe50f1](https://github.com/dungle-scrubs/tallow/commit/1fe50f16a192ab975fd8775cc47e8b7b345a3b08))
+* **tui:** deduplicate terminal capability env test helper ([ef0fc78](https://github.com/dungle-scrubs/tallow/commit/ef0fc785067bb62fd4e17da0128efee43b36e1ab))
+* **tui:** move capability env helper to test-utils ([b336116](https://github.com/dungle-scrubs/tallow/commit/b336116c6dbdf29791ed5bf4ce26c000b6b8dee2))
+* **utils:** wait for agent_end before unsubscribing runner ([350c848](https://github.com/dungle-scrubs/tallow/commit/350c8486e2973a94f6af315a8d248108116a3bcc))
+
+## [0.8.15](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.14...tallow-v0.8.15) (2026-03-05)
+
+
+### Added
+
+* **context-budget:** add planner envelopes and ingestion guards ([a109c49](https://github.com/dungle-scrubs/tallow/commit/a109c49366e71050ee39a41350852580f1918421))
+* **plan-mode:** auto-enable plan mode from natural language intent ([8a91fb0](https://github.com/dungle-scrubs/tallow/commit/8a91fb0bc1a0b840ad9f96b5478950575fee7eaa))
+
+
+### Fixed
+
+* **ask-user-question:** sanitize multiline option rendering ([265957a](https://github.com/dungle-scrubs/tallow/commit/265957adedbcb6ff7460651865c68f2732d53686))
+* **ci:** add actions:write permission to dep-check workflow ([0b960ee](https://github.com/dungle-scrubs/tallow/commit/0b960eee2828b9eaa0b2b2819e4a800971d66ca2)), closes [#116](https://github.com/dungle-scrubs/tallow/issues/116)
+* **interactive:** suppress overflow error payload before auto-compaction ([85da4cf](https://github.com/dungle-scrubs/tallow/commit/85da4cf19989bec18fce294e8b35a31117641fc2))
+* **shell-policy:** show approval notice after confirmation ([844bc22](https://github.com/dungle-scrubs/tallow/commit/844bc227f347926d7f2e7866275838e6dd0ce939))
+* **tui:** preserve scrollback during agent turns ([055f917](https://github.com/dungle-scrubs/tallow/commit/055f917f0bf379ffce133977cf902a3e40fed439))
+* **wezterm-pane:** avoid unsolicited pane spawning for dev servers ([4baa9e8](https://github.com/dungle-scrubs/tallow/commit/4baa9e8bd874c5b9fe1711c10e2f2bae678506a3))
+* **wezterm-pane:** block pane creation without explicit request ([57dc7f9](https://github.com/dungle-scrubs/tallow/commit/57dc7f9f6e921df671170e0b616495aa53a4cdc6))
+
+
+### Documentation
+
+* **context-budget:** document guardrails and adaptive caps ([423a46d](https://github.com/dungle-scrubs/tallow/commit/423a46d683fbe40e3e189f70c071af030604362a))
+
+
+### Maintenance
+
+* **ask-user-question:** add down-arrow render regression coverage ([6c9af0e](https://github.com/dungle-scrubs/tallow/commit/6c9af0e330b32f74e075a73650a0f9f9bb5f77f1))
+* **deps:** bump pi-* dependencies ([7fea391](https://github.com/dungle-scrubs/tallow/commit/7fea39130e3df6f692178496d298f0fd366130db))
+* **deps:** bump pi-* dependencies ([6db17c4](https://github.com/dungle-scrubs/tallow/commit/6db17c4e331e82b48379d1139a6279067a3fca4b))
+* **plan-mode:** add plan intent detection test suite ([a88bd55](https://github.com/dungle-scrubs/tallow/commit/a88bd55d8ddb9307b46927cda36d6e18e8d8ccde))
+
 ## [0.8.14](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.13...tallow-v0.8.14) (2026-02-26)
 
 
@@ -217,33 +618,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * **trust:** cover boxed project trust banner and payload ([8dc3878](https://github.com/dungle-scrubs/tallow/commit/8dc38781adad6df55618e53529eddd5b4a1a9c3f))
 * **tui:** add border and shrink-regression coverage ([f946979](https://github.com/dungle-scrubs/tallow/commit/f946979a3fd543723e84833e3f5811bed7133f88))
 
-## [Unreleased]
-
-### Added
-
-- **plan-mode:** prompt for optional user guidance when blocked tool results occur during plan execution and inject `[PLAN GUIDANCE — Step n: ...]` steer context
-- **read-tool-enhanced:** parse `.ipynb` notebooks into structured markdown/code/output text with safe image and html placeholders
-- **sdk,context-usage,debug:** summarize oversized historical tool results after each turn and surface retained/reclaimed payload bytes for long-session profiling
-- **worktree:** add detached session and subagent worktree isolation with lifecycle hooks, stale cleanup, and CLI `-w/--worktree` support
-
-### Changed
-
-- **extensions:** lazy-initialize command expansion, context scanning, context fork indexing, and MCP startup connections behind first-use triggers
-- **lsp:** allow configuring language-server startup timeout via `lsp.startupTimeoutMs` with project-over-user precedence
-- **permissions:** add structured deny/ask reason metadata with redaction-safe messaging and shell-policy alignment
-- **subagent-tool:** compact completed background-agent histories with retained final output, bounded debug tails, and stale-record cleanup
-- **teams-tool:** enforce ring-buffer retention for team message logs with debug and limit env overrides
-
-### Fixed
-
-- **tasks:** render foreground subagents inline-only while keeping bottom widget lanes background-only
-- **tui:** realign differential-render viewport coordinates after shrink churn to prevent input editor border lines from being cleared
-
-### Documentation
-
-- **agents:** add extension startup policy guidance for minimal `session_start` handlers and shared lazy initialization
-- **permissions:** add allow/ask/deny reason examples with redaction behavior
-
 ## [0.8.6](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.8.5...tallow-v0.8.6) (2026-02-20)
 
 
@@ -444,98 +818,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 * **ci:** remove redundant publish.yml — release.yml handles OIDC publish ([07f7110](https://github.com/dungle-scrubs/tallow/commit/07f71109015bc37c090e7568adfceb179a8828dc))
 
-## [Unreleased]
-
-### Added
-
-- **core:** `IS_DEMO` / `TALLOW_DEMO` env var and `--demo` CLI flag to hide
-  sensitive info (paths, session IDs) for screen recordings and live demos
-- **custom-footer:** `[DEMO]` badge and path sanitization when demo mode is active
-- **sdk:** export `isDemoMode()` and `sanitizePath()` helpers for extensions
-- **plugins:** plugin resolver with cache, format detection, and session
-  startup integration
-- **context-files:** discover nested subdirectory rule files in
-  `.tallow/rules/` and `.claude/rules/`
-- **init:** nested `.claude/` → `.tallow/` directory rename and nested
-  `CLAUDE.md` → `AGENTS.md` migration in `/init`
-- **trust:** per-project trust store with config fingerprinting and
-  `/trust-project`, `/untrust-project`, `/trust-status` commands
-- **startup:** add `startupProfile` (`interactive`/`headless`) session option,
-  headless UI-extension skip policy, and `TALLOW_STARTUP_TIMING` metrics for
-  create-session, bind-extensions, and first-token
-
-### Changed
-
-- **subagent:** extract model resolver, router, and matrix to
-  `@dungle-scrubs/synapse`
-- **subagent:** surface `routing` settings (`enabled`, `primaryType`,
-  `costPreference`) in schema/docs and support project-over-user
-  precedence for routing defaults
-- **web-fetch:** remove Firecrawl fallback and JS-detection — plain HTTP
-  fetch with 50KB truncation only
-- **debug:** rename `/diag*` commands to `/diagnostics*` and make
-  `/diagnostics` capability-aware with WezTerm live-pane follow fallback
-- **tasks/teams-tool:** align task and team dashboard rendering to shared
-  presentation roles, emphasizing identity/action context over process chatter
-
-### Fixed
-
-- **tools:** add missing `isError` flag to error responses in lsp, read,
-  and ask-user-question
-- **debug:** redact secret-like fields in debug log payloads before
-  truncation
-- **lsp:** bound startup and request operations with timeout + abort cleanup
-  so hung language servers do not block tool calls
-- **hooks:** translate Claude Code hook events and tool matchers from
-  `.claude/settings.json` so PreToolUse/PostToolUse/Stop hooks run in tallow
-- **hooks:** bound hook subprocess output buffers and enforce SIGTERM→SIGKILL
-  timeout/abort escalation for command and agent hooks
-- **tui:** clear stale working and queued steering/follow-up UI state on
-  turn end via interactive-mode runtime patch
-- **trust:** block untrusted project execution surfaces (`plugins`, hooks,
-  `mcpServers`, `packages`, `permissions`, shell interpolation, project extensions)
-- **mcp-adapter:** always load global `mcpServers`, gate project servers on trust,
-  and warn when project MCP config is skipped
-- **mcp-adapter:** abort timed-out and stopped SSE requests at the network layer
-  and clear pending request bookkeeping
-- **deps:** pin `ajv`, `fast-xml-parser`, and `minimatch` via overrides to
-  remediate current advisory paths from `@mariozechner/pi-ai`,
-  `@aws-sdk/xml-builder`, and `@mariozechner/pi-coding-agent`; remove
-  overrides once upstream ranges include fixed versions
-- **plugins:** ignore `<cwd>/.pi/settings.json` plugin entries
-- **plan-mode:** enforce strict read-only tool allowlist and block
-  non-allowlisted extension tools while plan mode is active
-- **pid-cleanup:** verify process start identity before signaling tracked PIDs
-  to prevent PID-reuse kills of unrelated processes
-- **wezterm-notify:** stabilize tab loader visibility by using agent-level
-  lifecycle signaling and redraw-driven spinner advancement to avoid short-run flicker
-- **subagent-tool:** add foreground liveness watchdog detection for stalled workers,
-  enforce SIGTERM→SIGKILL termination, and provide stalled-aware parallel
-  partial-result handling with interactive and headless escape hatches
-- **subagent-tool:** automatically retry stalled parallel workers once in
-  single-worker mode with narrowed-scope guidance and explicit model pinning
-  before returning partial error results
-- **tasks/subagent:** propagate `stalled` subagent status through interop snapshots
-  and widget rendering with explicit running/stalled labels
-
-### Documentation
-
-- **docs:** add WezTerm integration guide covering pane control, turn status
-  signaling, tab bar indicators, and WezTerm Lua configuration
-- **wezterm-notify:** new extension — signals agent turn status to WezTerm via
-  OSC 1337 user variables, enabling tab spinner and done-color indicators
-- **docs:** add presentation-role guidance for tool-display, tasks,
-  subagent-tool, and teams-tool, plus extension-first/TUI-fork-last-resort policy
-  updates in AGENTS.md
-
-### Removed
-
-- **image-gen:** remove image-gen extension (moved to external plugin)
-
-### Maintenance
-
-- **ci:** remove redundant `publish.yml` — `release.yml` handles OIDC publish
-
 ## [0.7.6](https://github.com/dungle-scrubs/tallow/compare/tallow-v0.7.5...tallow-v0.7.6) (2026-02-17)
 
 
@@ -690,8 +972,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 * stop tracking AGENTS.md (user-local file) ([7591e7f](https://github.com/dungle-scrubs/tallow/commit/7591e7fadd32bda8cd9bf9c2ecbe33f3cf93ddb7))
 * **subagent-tool:** add gpt-5.3-codex, spark, and 5.1-codex-max to matrix ([11d30a9](https://github.com/dungle-scrubs/tallow/commit/11d30a9cee00080160a9d570beb031c206b0b64e))
 * treat feat as patch bump while pre-1.0 ([646cd71](https://github.com/dungle-scrubs/tallow/commit/646cd71687213dd40d093a6615505ead1b8f8bdf))
-
-## [Unreleased]
 
 ## [0.7.1] - 2026-02-16
 

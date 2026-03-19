@@ -1,16 +1,40 @@
 import { describe, expect, it } from "bun:test";
 import { patchInteractiveModePrototype } from "../interactive-mode-patch.js";
 
+interface FakeMessageContent {
+	text?: string;
+	thinking?: string;
+	type: string;
+}
+
+interface FakeMessage {
+	content: FakeMessageContent[];
+	errorMessage?: string;
+	role: "assistant" | "user";
+	stopReason?: "aborted" | "error" | "stop";
+}
+
 interface FakeEvent {
+	aborted?: boolean;
+	errorMessage?: string;
+	message?: FakeMessage;
+	result?: unknown;
 	type?: string;
+	willRetry?: boolean;
 }
 
 class FakeInteractiveMode {
 	defaultEditor: { onEscape?: () => void } = {};
+	editor: { getText: () => string; setText: (text: string) => void };
+	editorText = "";
 	escapeCalls = 0;
+	executeCompactionCalls = 0;
+	executeCompactionResult: unknown = { summary: "ok" };
 	flushCalls = 0;
+	followUpQueue: string[] = [];
 	handleBashCommandCalls = 0;
 	handleEventCalls = 0;
+	lastHandledEvent: FakeEvent | undefined;
 	lastRestoredAbort: boolean | undefined;
 	lifecycleCalls: string[] = [];
 	loadingAnimation: unknown;
@@ -18,7 +42,14 @@ class FakeInteractiveMode {
 	pendingBashComponents: unknown[] = [];
 	pendingWorkingMessage: unknown = "stale";
 	renderRequests = 0;
-	session = { isStreaming: false };
+	session: {
+		clearQueue: () => { followUp: string[]; steering: string[] };
+		extensionRunner: { compactFn: ((options?: unknown) => void) | undefined };
+		getFollowUpMessages: () => string[];
+		getSteeringMessages: () => string[];
+		isStreaming: boolean;
+	};
+	steeringQueue: string[] = [];
 	statusClears = 0;
 	updateCalls = 0;
 	ui = {
@@ -28,14 +59,37 @@ class FakeInteractiveMode {
 		},
 	};
 
+	constructor() {
+		this.editor = {
+			getText: () => this.editorText,
+			setText: (text: string) => {
+				this.editorText = text;
+			},
+		};
+		this.session = {
+			clearQueue: () => {
+				const steering = [...this.steeringQueue];
+				const followUp = [...this.followUpQueue];
+				this.steeringQueue = [];
+				this.followUpQueue = [];
+				return { followUp, steering };
+			},
+			extensionRunner: { compactFn: undefined },
+			getFollowUpMessages: () => this.followUpQueue,
+			getSteeringMessages: () => this.steeringQueue,
+			isStreaming: false,
+		};
+	}
+
 	/**
 	 * Base handleEvent implementation used by the patch wrapper.
 	 *
 	 * @param _event - Event payload
 	 * @returns Promise resolved with marker text
 	 */
-	async handleEvent(_event: FakeEvent): Promise<string> {
+	async handleEvent(event: FakeEvent): Promise<string> {
 		this.handleEventCalls++;
+		this.lastHandledEvent = event;
 		return "ok";
 	}
 
@@ -66,6 +120,37 @@ class FakeInteractiveMode {
 		this.defaultEditor.onEscape = () => {
 			this.escapeCalls++;
 		};
+	}
+
+	/**
+	 * Base initExtensions implementation used by the patch wrapper.
+	 *
+	 * @returns Promise resolved after recording the lifecycle step
+	 */
+	async initExtensions(): Promise<void> {
+		this.lifecycleCalls.push("initExtensions");
+	}
+
+	/**
+	 * Base reload implementation used by the patch wrapper.
+	 *
+	 * @returns Promise resolved after recording the lifecycle step
+	 */
+	async handleReloadCommand(): Promise<void> {
+		this.lifecycleCalls.push("handleReloadCommand");
+	}
+
+	/**
+	 * Base executeCompaction implementation used by the patch wrapper.
+	 *
+	 * @param _customInstructions - Optional compaction instructions
+	 * @param _isAuto - Whether the compaction is automatic
+	 * @returns Configured mock compaction result
+	 */
+	async executeCompaction(_customInstructions?: string, _isAuto = false): Promise<unknown> {
+		this.executeCompactionCalls++;
+		this.lifecycleCalls.push("executeCompaction");
+		return this.executeCompactionResult;
 	}
 
 	/**
@@ -141,6 +226,36 @@ class FakeInteractiveMode {
 	}
 }
 
+/**
+ * Runs an async action with setTimeout forced to near-immediate callbacks.
+ *
+ * @param action - Action to execute under patched timers
+ * @returns Nothing
+ */
+async function withImmediateTimers(action: () => Promise<void>): Promise<void> {
+	const originalSetTimeout = globalThis.setTimeout;
+	globalThis.setTimeout = ((
+		callback: Parameters<typeof setTimeout>[0],
+		delay?: Parameters<typeof setTimeout>[1],
+		...args: unknown[]
+	) => {
+		return originalSetTimeout(
+			() => {
+				if (typeof callback === "function") {
+					callback(...args);
+				}
+			},
+			Math.min(typeof delay === "number" ? delay : 0, 5)
+		);
+	}) as typeof setTimeout;
+
+	try {
+		await action();
+	} finally {
+		globalThis.setTimeout = originalSetTimeout;
+	}
+}
+
 describe("patchInteractiveModePrototype", () => {
 	it("applies agent_end cleanup with bash flush before pending-message refresh", async () => {
 		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
@@ -168,6 +283,145 @@ describe("patchInteractiveModePrototype", () => {
 		expect(flushCallIndex).toBeGreaterThanOrEqual(0);
 		expect(updateCallIndex).toBeGreaterThanOrEqual(0);
 		expect(flushCallIndex).toBeLessThan(updateCallIndex);
+	});
+
+	it("suppresses overflow payloads while keeping a visible overflow indicator", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+
+		const overflowPayloads = [
+			'Codex error: {"type":"error","code":"context_length_exceeded","message":"prompt is too long"}',
+			// Provider fallback path: HTTP status with no body still signals overflow.
+			"413 (no body)",
+		] as const;
+
+		for (const errorMessage of overflowPayloads) {
+			const mode = new FakeInteractiveMode();
+
+			await mode.handleEvent({
+				type: "message_end",
+				message: {
+					content: [{ thinking: "internal trace", type: "thinking" }],
+					errorMessage,
+					role: "assistant",
+					stopReason: "error",
+				},
+			});
+
+			expect(mode.lastHandledEvent?.message?.stopReason).toBe("stop");
+			expect(mode.lastHandledEvent?.message?.errorMessage).toBeUndefined();
+			const visibleTextBlocks = (mode.lastHandledEvent?.message?.content ?? []).filter(
+				(part) =>
+					part.type === "text" &&
+					typeof part.text === "string" &&
+					part.text.includes("Context overflow detected")
+			);
+			expect(visibleTextBlocks.length).toBeGreaterThan(0);
+		}
+	});
+
+	it("keeps overflow-like message_end errors unchanged when tool calls are present", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		const originalMessage =
+			'Codex error: {"type":"error","code":"context_length_exceeded","message":"prompt is too long"}';
+
+		await mode.handleEvent({
+			type: "message_end",
+			message: {
+				// keep stopReason=error when tool calls exist so pending tool rows
+				// can resolve correctly in InteractiveMode.
+				content: [{ type: "toolCall" }],
+				errorMessage: originalMessage,
+				role: "assistant",
+				stopReason: "error",
+			},
+		});
+
+		expect(mode.lastHandledEvent?.message?.stopReason).toBe("error");
+		expect(mode.lastHandledEvent?.message?.errorMessage).toBe(originalMessage);
+	});
+
+	it("keeps non-overflow message_end errors unchanged", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+
+		const nonOverflowErrors = [
+			"401 Unauthorized: invalid API key",
+			"413 Request Entity Too Large",
+		] as const;
+
+		for (const originalMessage of nonOverflowErrors) {
+			const mode = new FakeInteractiveMode();
+
+			await mode.handleEvent({
+				type: "message_end",
+				message: {
+					content: [],
+					errorMessage: originalMessage,
+					role: "assistant",
+					stopReason: "error",
+				},
+			});
+
+			expect(mode.lastHandledEvent?.message?.stopReason).toBe("error");
+			expect(mode.lastHandledEvent?.message?.errorMessage).toBe(originalMessage);
+		}
+	});
+
+	it("warns when retry continuation does not start after auto-compaction end", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+
+		await withImmediateTimers(async () => {
+			const mode = new FakeInteractiveMode();
+			await mode.handleEvent({ type: "auto_compaction_end", willRetry: true });
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			const warning = mode.notifyCalls.find(
+				(call) => call.type === "warning" && call.message.includes("continuation did not start")
+			);
+			expect(warning).toBeDefined();
+		});
+	});
+
+	it("disarms retry watchdog when continuation starts", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+
+		await withImmediateTimers(async () => {
+			const mode = new FakeInteractiveMode();
+			await mode.handleEvent({ type: "auto_compaction_end", willRetry: true });
+			await mode.handleEvent({ type: "message_start" });
+			await new Promise((resolve) => setTimeout(resolve, 10));
+
+			const warning = mode.notifyCalls.find((call) =>
+				call.message.includes("continuation did not start")
+			);
+			expect(warning).toBeUndefined();
+		});
+	});
+
+	it("warns on ambiguous auto-compaction terminal states", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		await mode.handleEvent({ type: "auto_compaction_end" });
+
+		const warning = mode.notifyCalls.find(
+			(call) => call.type === "warning" && call.message.includes("without a clear result")
+		);
+		expect(warning).toBeDefined();
+	});
+
+	it("does not warn on non-ambiguous auto-compaction terminal states", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		await mode.handleEvent({ result: { summary: "ok" }, type: "auto_compaction_end" });
+		await mode.handleEvent({ aborted: true, type: "auto_compaction_end" });
+		await mode.handleEvent({ errorMessage: "quota exceeded", type: "auto_compaction_end" });
+
+		const warning = mode.notifyCalls.find((call) =>
+			call.message.includes("without a clear result")
+		);
+		expect(warning).toBeUndefined();
 	});
 
 	it("flushes deferred bash output after wrapped handleBashCommand and refreshes UI", async () => {
@@ -313,5 +567,241 @@ describe("patchInteractiveModePrototype", () => {
 			| (() => boolean)
 			| undefined;
 		expect(hasQueued?.()).toBe(false);
+	});
+
+	it("rebinds extension compact to InteractiveMode compaction on init and reload", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		let completed = 0;
+
+		await mode.initExtensions();
+		expect(typeof mode.session.extensionRunner.compactFn).toBe("function");
+
+		mode.session.extensionRunner.compactFn?.({
+			onComplete: () => {
+				completed++;
+			},
+		});
+		await Promise.resolve();
+
+		expect(mode.executeCompactionCalls).toBe(1);
+		expect(completed).toBe(1);
+
+		await mode.handleReloadCommand();
+		mode.session.extensionRunner.compactFn?.({
+			onComplete: () => {
+				completed++;
+			},
+		});
+		await Promise.resolve();
+
+		expect(mode.executeCompactionCalls).toBe(2);
+		expect(completed).toBe(2);
+	});
+
+	it("defers extension compact until agent_end when the session is still streaming", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		let completed = 0;
+
+		await mode.initExtensions();
+		mode.session.isStreaming = true;
+		mode.session.extensionRunner.compactFn?.({
+			onComplete: () => {
+				completed++;
+			},
+		});
+
+		expect(mode.executeCompactionCalls).toBe(0);
+
+		mode.session.isStreaming = false;
+		await mode.handleEvent({ type: "agent_end" });
+
+		expect(mode.executeCompactionCalls).toBe(1);
+		expect(completed).toBe(1);
+	});
+
+	it("treats undefined InteractiveMode compaction results as cleanup-worthy errors", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		mode.executeCompactionResult = undefined;
+		let errorMessage: string | undefined;
+
+		await mode.initExtensions();
+		mode.session.extensionRunner.compactFn?.({
+			onError: (error: Error) => {
+				errorMessage = error.message;
+			},
+		});
+		await Promise.resolve();
+
+		expect(mode.executeCompactionCalls).toBe(1);
+		expect(errorMessage).toBe("Compaction did not complete");
+	});
+
+	// ── message_update coalescing (plan 176) ──────────────────────────────
+
+	it("coalesces rapid message_update events into one handleEvent call per I/O cycle", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		// Fire 20 rapid message_update events (simulates streaming tokens)
+		for (let i = 0; i < 20; i++) {
+			mode.handleEvent({
+				type: "message_update",
+				message: {
+					role: "assistant",
+					content: [{ type: "text", text: `token-${i}` }],
+				},
+			});
+		}
+
+		// None should have been processed synchronously
+		expect(mode.handleEventCalls).toBe(0);
+
+		// Wait for I/O flush (scheduleAfterIO uses setTimeout(0) on Bun)
+		await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+		// Only one call should have been made (the last coalesced event)
+		expect(mode.handleEventCalls).toBe(1);
+		expect(mode.lastHandledEvent?.message?.content?.[0]).toEqual({
+			type: "text",
+			text: "token-19",
+		});
+	});
+
+	it("flushes pending message_update before message_end", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		// Buffer a message_update
+		mode.handleEvent({
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "partial" }] },
+		});
+
+		// Now fire message_end — should flush the pending update first
+		await mode.handleEvent({
+			type: "message_end",
+			message: {
+				role: "assistant",
+				content: [{ type: "text", text: "final" }],
+				stopReason: "stop",
+			},
+		});
+
+		// handleEvent should have been called twice: once for flushed update, once for message_end
+		expect(mode.handleEventCalls).toBe(2);
+	});
+
+	it("flushes pending message_update before tool_execution_start", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		// Buffer a message_update
+		mode.handleEvent({
+			type: "message_update",
+			message: { role: "assistant", content: [{ type: "text", text: "thinking..." }] },
+		});
+
+		// Fire tool_execution_start — should flush first
+		await mode.handleEvent({ type: "tool_execution_start" });
+
+		// Two calls: flushed update + tool_execution_start
+		expect(mode.handleEventCalls).toBe(2);
+	});
+
+	it("does not coalesce non-message_update events", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		await mode.handleEvent({ type: "message_start" });
+		expect(mode.handleEventCalls).toBe(1);
+
+		await mode.handleEvent({ type: "tool_execution_end" });
+		expect(mode.handleEventCalls).toBe(2);
+	});
+
+	it("handles agent_end after coalesced message_updates", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+
+		// Simulate streaming burst followed by agent_end
+		for (let i = 0; i < 10; i++) {
+			mode.handleEvent({
+				type: "message_update",
+				message: { role: "assistant", content: [{ type: "text", text: `t-${i}` }] },
+			});
+		}
+
+		// agent_end should flush the pending update
+		await mode.handleEvent({ type: "agent_end" });
+
+		// 1 flushed message_update + 1 agent_end
+		expect(mode.handleEventCalls).toBe(2);
+		// agent_end cleanup should still run
+		expect(mode.pendingWorkingMessage).toBeUndefined();
+	});
+
+	// ── orphaned steering/follow-up drain at agent_end ────────────────────
+
+	it("drains orphaned steering messages to the editor at agent_end", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		mode.steeringQueue.push("what is metal toolchain for?", "do I need it on my machine?");
+
+		await mode.handleEvent({ type: "agent_end" });
+
+		// Steering queue should be drained
+		expect(mode.steeringQueue).toEqual([]);
+		// Messages should be restored to the editor
+		expect(mode.editorText).toBe("what is metal toolchain for?\n\ndo I need it on my machine?");
+		// Pending messages display should be updated (zombies cleared)
+		expect(mode.updateCalls).toBeGreaterThanOrEqual(1);
+	});
+
+	it("drains orphaned follow-up messages to the editor at agent_end", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		mode.followUpQueue.push("also check the ansible playbook");
+
+		await mode.handleEvent({ type: "agent_end" });
+
+		expect(mode.followUpQueue).toEqual([]);
+		expect(mode.editorText).toBe("also check the ansible playbook");
+	});
+
+	it("combines orphaned messages with existing editor text", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		mode.steeringQueue.push("stale steering");
+		mode.editorText = "new message in progress";
+
+		await mode.handleEvent({ type: "agent_end" });
+
+		expect(mode.editorText).toBe("stale steering\n\nnew message in progress");
+	});
+
+	it("does not touch the editor when no orphaned messages exist", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		mode.editorText = "user is typing";
+
+		await mode.handleEvent({ type: "agent_end" });
+
+		expect(mode.editorText).toBe("user is typing");
+	});
+
+	it("drains both steering and follow-up in correct order", async () => {
+		patchInteractiveModePrototype(FakeInteractiveMode.prototype as never);
+		const mode = new FakeInteractiveMode();
+		mode.steeringQueue.push("steer1", "steer2");
+		mode.followUpQueue.push("follow1");
+
+		await mode.handleEvent({ type: "agent_end" });
+
+		expect(mode.steeringQueue).toEqual([]);
+		expect(mode.followUpQueue).toEqual([]);
+		expect(mode.editorText).toBe("steer1\n\nsteer2\n\nfollow1");
 	});
 });

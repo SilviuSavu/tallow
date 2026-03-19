@@ -30,10 +30,21 @@ export interface ProjectTrustContext {
 	readonly status: ProjectTrustStatus;
 }
 
-/** On-disk trust store entry for a single project. */
+/** Persisted trust schema version for fingerprints written by this build. */
+const PROJECT_TRUST_SCHEMA_VERSION = 2;
+
+/** In-memory trust store entry for a single project. */
 interface ProjectTrustStoreEntry {
 	readonly fingerprint: string;
 	readonly trustedAt: string;
+	readonly version: number | null;
+}
+
+/** Serialized trust store entry written to disk. */
+interface PersistedProjectTrustStoreEntry {
+	readonly fingerprint: string;
+	readonly trustedAt: string;
+	readonly version?: number;
 }
 
 /** Parsed trust store keyed by canonical project path. */
@@ -78,6 +89,64 @@ function getTrustStoreDir(): string {
 }
 
 /**
+ * Build a current-schema trust store entry.
+ *
+ * @param fingerprint - Current trust fingerprint
+ * @param trustedAt - Original trust approval timestamp
+ * @returns Current-schema trust store entry
+ */
+function createCurrentTrustStoreEntry(
+	fingerprint: string,
+	trustedAt: string
+): ProjectTrustStoreEntry {
+	return {
+		fingerprint,
+		trustedAt,
+		version: PROJECT_TRUST_SCHEMA_VERSION,
+	};
+}
+
+/**
+ * Return true when a stored trust entry predates the current schema.
+ *
+ * @param entry - Trust store entry to inspect
+ * @returns True when the entry should be migrated forward
+ */
+function shouldMigrateTrustStoreEntry(entry: ProjectTrustStoreEntry): boolean {
+	if (entry.version === null) return true;
+	return entry.version < PROJECT_TRUST_SCHEMA_VERSION;
+}
+
+/**
+ * Convert an in-memory trust store to its persisted JSON representation.
+ *
+ * Legacy entries omit the `version` key to preserve their original shape
+ * unless they are explicitly migrated.
+ *
+ * @param store - Trust store to serialize
+ * @returns JSON-safe trust store object
+ */
+function serializeTrustStore(
+	store: ProjectTrustStore
+): Record<string, PersistedProjectTrustStoreEntry> {
+	const persisted: Record<string, PersistedProjectTrustStoreEntry> = {};
+	for (const [key, entry] of Object.entries(store)) {
+		persisted[key] =
+			typeof entry.version === "number"
+				? {
+						fingerprint: entry.fingerprint,
+						trustedAt: entry.trustedAt,
+						version: entry.version,
+					}
+				: {
+						fingerprint: entry.fingerprint,
+						trustedAt: entry.trustedAt,
+					};
+	}
+	return persisted;
+}
+
+/**
  * Load the project trust store from disk.
  *
  * Corrupt or unreadable data is treated as an empty store to fail closed.
@@ -102,9 +171,13 @@ function loadTrustStore(): ProjectTrustStore {
 		const store: ProjectTrustStore = {};
 		for (const [key, value] of Object.entries(parsed)) {
 			if (!value || typeof value !== "object") continue;
-			const entry = value as Partial<ProjectTrustStoreEntry>;
+			const entry = value as Partial<PersistedProjectTrustStoreEntry>;
 			if (typeof entry.fingerprint !== "string" || typeof entry.trustedAt !== "string") continue;
-			store[key] = { fingerprint: entry.fingerprint, trustedAt: entry.trustedAt };
+			store[key] = {
+				fingerprint: entry.fingerprint,
+				trustedAt: entry.trustedAt,
+				version: typeof entry.version === "number" ? entry.version : null,
+			};
 		}
 		return store;
 	} catch {
@@ -128,7 +201,7 @@ function saveTrustStore(store: ProjectTrustStore): void {
 		if (!existsSync(trustDir)) {
 			mkdirSync(trustDir, { recursive: true });
 		}
-		const json = JSON.stringify(store, null, "\t");
+		const json = JSON.stringify(serializeTrustStore(store), null, "\t");
 		atomicWriteFileSync(getTrustStorePath(), `${json}\n`);
 	} catch {
 		// Persist failures leave trust ephemeral for this process but do not
@@ -153,14 +226,31 @@ export function getCanonicalCwd(cwd: string): string {
 	}
 }
 
-/** Keys from .tallow/settings.json that are part of the trust scope. */
-const SETTINGS_TRUST_KEYS = [
+/** Keys from `.tallow/settings*.json` that are part of the trust scope. */
+const TALLOW_SETTINGS_TRUST_KEYS = [
 	"plugins",
 	"hooks",
 	"mcpServers",
 	"packages",
 	"permissions",
 	"shellInterpolation",
+] as const;
+
+/** Keys from `.claude/settings*.json` that can change trusted behavior. */
+const CLAUDE_SETTINGS_TRUST_KEYS = ["hooks", "permissions"] as const;
+
+/** Project-local directories whose contents affect trusted execution. */
+const TRUST_SCOPED_DIRECTORIES = [
+	{ label: "tallow-extensions", relativePath: join(".tallow", "extensions") },
+	{ label: "tallow-agents", relativePath: join(".tallow", "agents") },
+	{ label: "tallow-skills", relativePath: join(".tallow", "skills") },
+	{ label: "tallow-prompts", relativePath: join(".tallow", "prompts") },
+	{ label: "tallow-commands", relativePath: join(".tallow", "commands") },
+	{ label: "tallow-rules", relativePath: join(".tallow", "rules") },
+	{ label: "claude-agents", relativePath: join(".claude", "agents") },
+	{ label: "claude-skills", relativePath: join(".claude", "skills") },
+	{ label: "claude-commands", relativePath: join(".claude", "commands") },
+	{ label: "claude-rules", relativePath: join(".claude", "rules") },
 ] as const;
 
 /**
@@ -205,13 +295,104 @@ function collectFilesRecursively(rootDir: string): string[] {
 }
 
 /**
+ * Hash a settings file, optionally restricting the fingerprint to selected top-level keys.
+ *
+ * @param hash - Hash accumulator receiving the file fingerprint
+ * @param canonicalCwd - Canonical project root used for relative path stability
+ * @param filePath - Absolute settings file path
+ * @param label - Stable label written into the hash stream
+ * @param keys - Optional subset of top-level keys to include
+ * @returns void
+ */
+function hashSettingsFile(
+	hash: ReturnType<typeof createHash>,
+	canonicalCwd: string,
+	filePath: string,
+	label: string,
+	keys?: readonly string[]
+): void {
+	hash.update(`${label}:${relative(canonicalCwd, filePath)}\n`);
+	if (!existsSync(filePath)) {
+		hash.update("missing\n");
+		return;
+	}
+
+	let raw: string | null = null;
+	try {
+		raw = readFileSync(filePath, "utf-8");
+	} catch {
+		raw = null;
+	}
+
+	if (raw === null) {
+		hash.update("unreadable\n");
+		return;
+	}
+
+	try {
+		const parsed = JSON.parse(raw) as Record<string, unknown>;
+		if (!keys) {
+			hash.update(JSON.stringify(parsed));
+			return;
+		}
+
+		const subset: Record<string, unknown> = {};
+		for (const key of keys) {
+			if (Object.hasOwn(parsed, key)) {
+				subset[key] = parsed[key];
+			}
+		}
+		hash.update(JSON.stringify(subset));
+	} catch {
+		// Invalid JSON still needs to invalidate trust deterministically.
+		hash.update("raw:\n");
+		hash.update(raw);
+	}
+}
+
+/**
+ * Hash a project-local file or directory tree into the project trust fingerprint.
+ *
+ * @param hash - Hash accumulator receiving the tree fingerprint
+ * @param canonicalCwd - Canonical project root used for relative path stability
+ * @param label - Stable label written into the hash stream
+ * @param fullPath - Absolute file or directory path
+ * @returns void
+ */
+function hashProjectPath(
+	hash: ReturnType<typeof createHash>,
+	canonicalCwd: string,
+	label: string,
+	fullPath: string
+): void {
+	const files = collectFilesRecursively(fullPath);
+	if (files.length === 0) {
+		hash.update(`${label}-none\n`);
+		return;
+	}
+
+	hash.update(`${label}\n`);
+	for (const filePath of files) {
+		const rel = relative(canonicalCwd, filePath);
+		hash.update(`file:${rel}\n`);
+		try {
+			const content = readFileSync(filePath);
+			hash.update(content);
+		} catch {
+			hash.update("<unreadable>\n");
+		}
+	}
+}
+
+/**
  * Compute a stable SHA-256 fingerprint over trust-scoped project files.
  *
  * Trust scope:
- * - .tallow/settings.json keys: plugins, hooks, mcpServers, packages,
+ * - `.tallow/settings*.json` keys: plugins, hooks, mcpServers, packages,
  *   permissions, shellInterpolation
- * - .tallow/hooks.json (entire contents)
- * - .tallow/extensions/** (all files under this directory)
+ * - `.claude/settings*.json` keys: hooks, permissions
+ * - `.tallow/hooks.json` (entire contents)
+ * - project-local trusted resource directories such as agents/extensions/skills
  *
  * @param canonicalCwd - Canonical project root path
  * @returns Hex-encoded fingerprint string
@@ -219,84 +400,47 @@ function collectFilesRecursively(rootDir: string): string[] {
 export function computeProjectFingerprint(canonicalCwd: string): string {
 	const hash = createHash("sha256");
 	const projectConfigDir = join(canonicalCwd, ".tallow");
+	const projectClaudeDir = join(canonicalCwd, ".claude");
 
-	hash.update("tallow-project-trust/v1\n");
+	hash.update(`tallow-project-trust/v${PROJECT_TRUST_SCHEMA_VERSION}\n`);
 
-	// .tallow/settings.json subset
-	const settingsPath = join(projectConfigDir, "settings.json");
-	if (existsSync(settingsPath)) {
-		let raw: string | null = null;
-		try {
-			raw = readFileSync(settingsPath, "utf-8");
-		} catch {
-			raw = null;
-		}
+	hashSettingsFile(
+		hash,
+		canonicalCwd,
+		join(projectConfigDir, "settings.json"),
+		"tallow-settings",
+		TALLOW_SETTINGS_TRUST_KEYS
+	);
+	hashSettingsFile(
+		hash,
+		canonicalCwd,
+		join(projectConfigDir, "settings.local.json"),
+		"tallow-settings-local",
+		TALLOW_SETTINGS_TRUST_KEYS
+	);
+	hashSettingsFile(
+		hash,
+		canonicalCwd,
+		join(projectClaudeDir, "settings.json"),
+		"claude-settings",
+		CLAUDE_SETTINGS_TRUST_KEYS
+	);
+	hashSettingsFile(
+		hash,
+		canonicalCwd,
+		join(projectClaudeDir, "settings.local.json"),
+		"claude-settings-local",
+		CLAUDE_SETTINGS_TRUST_KEYS
+	);
+	hashSettingsFile(hash, canonicalCwd, join(projectConfigDir, "hooks.json"), "tallow-hooks");
 
-		hash.update("settings\n");
-
-		if (raw !== null) {
-			try {
-				const parsed = JSON.parse(raw) as Record<string, unknown>;
-				const subset: Record<string, unknown> = {};
-				for (const key of SETTINGS_TRUST_KEYS) {
-					if (Object.hasOwn(parsed, key)) {
-						subset[key] = parsed[key];
-					}
-				}
-				hash.update(JSON.stringify(subset));
-			} catch {
-				// Invalid JSON — fall back to raw content so changes still
-				// invalidate trust even if the file is temporarily corrupt.
-				hash.update("raw:\n");
-				hash.update(raw);
-			}
-		} else {
-			hash.update("missing\n");
-		}
-	} else {
-		hash.update("settings-missing\n");
-	}
-
-	// .tallow/hooks.json (entire file, canonicalized when JSON)
-	const hooksPath = join(projectConfigDir, "hooks.json");
-	if (existsSync(hooksPath)) {
-		try {
-			const raw = readFileSync(hooksPath, "utf-8");
-			try {
-				const parsed = JSON.parse(raw) as unknown;
-				hash.update("hooks-json\n");
-				hash.update(JSON.stringify(parsed));
-			} catch {
-				hash.update("hooks-raw\n");
-				hash.update(raw);
-			}
-		} catch {
-			hash.update("hooks-unreadable\n");
-		}
-	} else {
-		hash.update("hooks-missing\n");
-	}
-
-	// .tallow/extensions/** (all files, path + bytes)
-	const extensionsDir = join(projectConfigDir, "extensions");
-	const extensionFiles = collectFilesRecursively(extensionsDir);
-	if (extensionFiles.length === 0) {
-		hash.update("extensions-none\n");
-	} else {
-		hash.update("extensions\n");
-		for (const filePath of extensionFiles) {
-			const rel = relative(canonicalCwd, filePath);
-			// Include relative path so renames also affect fingerprint.
-			hash.update(`file:${rel}\n`);
-			try {
-				const content = readFileSync(filePath);
-				hash.update(content);
-			} catch {
-				// Unreadable file still contributes a stable token so changes
-				// in readability/fix also update the fingerprint.
-				hash.update("<unreadable>\n");
-			}
-		}
+	for (const directory of TRUST_SCOPED_DIRECTORIES) {
+		hashProjectPath(
+			hash,
+			canonicalCwd,
+			directory.label,
+			join(canonicalCwd, directory.relativePath)
+		);
 	}
 
 	return hash.digest("hex");
@@ -369,18 +513,36 @@ export function resolveProjectTrust(cwd: string): ProjectTrustContext {
 	const fingerprint = computeProjectFingerprint(canonicalCwd);
 	const store = loadTrustStore();
 	const entry = store[canonicalCwd] ?? null;
-	const storedFingerprint = entry?.fingerprint ?? null;
 
-	let status: ProjectTrustStatus;
 	if (!entry) {
-		status = "untrusted";
-	} else if (entry.fingerprint === fingerprint) {
-		status = "trusted";
-	} else {
-		status = "stale_fingerprint";
+		return {
+			canonicalCwd,
+			fingerprint,
+			storedFingerprint: null,
+			status: "untrusted",
+		};
 	}
 
-	return { canonicalCwd, fingerprint, storedFingerprint, status };
+	if (shouldMigrateTrustStoreEntry(entry)) {
+		const migratedEntry = createCurrentTrustStoreEntry(fingerprint, entry.trustedAt);
+		store[canonicalCwd] = migratedEntry;
+		saveTrustStore(store);
+		return {
+			canonicalCwd,
+			fingerprint,
+			storedFingerprint: migratedEntry.fingerprint,
+			status: "trusted",
+		};
+	}
+
+	const status: ProjectTrustStatus =
+		entry.fingerprint === fingerprint ? "trusted" : "stale_fingerprint";
+	return {
+		canonicalCwd,
+		fingerprint,
+		storedFingerprint: entry.fingerprint,
+		status,
+	};
 }
 
 /**
@@ -395,10 +557,7 @@ export function trustProject(cwd: string): ProjectTrustContext {
 	const fingerprint = computeProjectFingerprint(canonicalCwd);
 	const store = loadTrustStore();
 
-	store[canonicalCwd] = {
-		fingerprint,
-		trustedAt: new Date().toISOString(),
-	};
+	store[canonicalCwd] = createCurrentTrustStoreEntry(fingerprint, new Date().toISOString());
 
 	saveTrustStore(store);
 

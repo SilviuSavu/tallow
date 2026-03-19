@@ -16,6 +16,7 @@ import {
 	APP_NAME,
 	bootstrap,
 	isDemoMode,
+	PACKAGE_DIR,
 	sanitizePath,
 	TALLOW_HOME,
 	TALLOW_VERSION,
@@ -35,9 +36,9 @@ registerFatalErrorHandlers();
 const cleanupSessionRef = registerProcessCleanup();
 
 import { execFileSync } from "node:child_process";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import {
 	InteractiveMode,
 	runPrintMode,
@@ -45,6 +46,7 @@ import {
 	SessionManager,
 } from "@mariozechner/pi-coding-agent";
 import { Command, Option } from "commander";
+import { maybeAutoRebuildCurrentCli } from "./cli-auto-rebuild.js";
 import {
 	type BundledExtensionCatalogEntry,
 	createTallowSession,
@@ -54,6 +56,12 @@ import {
 	type TallowSessionOptions,
 } from "./sdk-client.js";
 import { resolveStartupProfile } from "./startup-profile.js";
+import {
+	registerWorkspaceTransitionHost,
+	type WorkspaceTransitionUI,
+} from "./workspace-transition.js";
+import { createInteractiveWorkspaceTransitionHost } from "./workspace-transition-interactive.js";
+import { tryCreateTransitionRelayServer } from "./workspace-transition-relay.js";
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
@@ -68,6 +76,10 @@ program
 	.option("-m, --model <model>", "Model to use (provider/model-id)")
 	.option("--provider <provider>", "Provider to use (anthropic, openai, google, etc.)")
 	.option("-w, --worktree", "Run this session in a temporary detached git worktree")
+	.option(
+		"--yolo",
+		"Auto-approve all tool confirmations (high-risk commands, permission ask-tier rules). Hard denies (fork bombs, rm -rf /, etc.) remain blocked."
+	)
 	// --api-key removed: leaks secrets in `ps` output. Use TALLOW_API_KEY/TALLOW_API_KEY_REF.
 	.option("--mode <mode>", "Run mode: interactive, rpc, json", "interactive")
 	.option("--thinking <level>", "Thinking level: off, minimal, low, medium, high, xhigh")
@@ -116,6 +128,8 @@ program
 	.option("--home", "Print Tallow home directory")
 	.option("--demo", "Demo mode: hide sensitive info (paths, session IDs) for recordings")
 	.option("--debug", "Enable debug diagnostic logging")
+	.option("--append-system-prompt <text>", "Append text or file contents to the system prompt")
+	.option("--system-prompt <text>", "Override the system prompt entirely")
 	.addOption(new Option("--init").hideHelp())
 	.addOption(new Option("--init-only").hideHelp())
 	.addOption(new Option("--maintenance").hideHelp())
@@ -123,8 +137,11 @@ program
 
 program
 	.command("install")
-	.description("Interactive installer — choose extensions, themes, and set up tallow")
-	.option("-y, --yes", "Non-interactive: keep all settings, update templates")
+	.description("Interactive installer — choose extensions, themes, and manage ~/.tallow")
+	.option(
+		"-y, --yes",
+		"Non-interactive: refresh templates and apply only the explicit config flags you pass"
+	)
 	.option("--default-provider <provider>", "Set default provider (anthropic, openai, google)")
 	.option("--default-model <model>", "Set default model ID (e.g., claude-sonnet-4)")
 	// --api-key removed: leaks secrets in `ps` output. Use TALLOW_API_KEY/TALLOW_API_KEY_REF.
@@ -135,7 +152,8 @@ program
 	)
 	.action(async () => {
 		// Dynamically import so the main CLI stays lightweight
-		await import("./install-flow.js");
+		const { runInstallerCli } = await import("./install-flow.js");
+		await runInstallerCli();
 	});
 
 program
@@ -147,7 +165,30 @@ program
 		runExtensionsCommand(id, options);
 	});
 
+maybeAutoRebuildCurrentCli({ packageDir: PACKAGE_DIR });
 program.parse();
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/**
+ * Resolve a prompt input that may be inline text or a file path.
+ * Matches pi framework behavior: if the value is a valid file path, reads it;
+ * otherwise returns the string as-is.
+ *
+ * @param input - Inline text or path to a file containing the prompt
+ * @returns Resolved prompt text, or undefined if input is undefined
+ */
+function resolvePromptInput(input: string | undefined): string | undefined {
+	if (!input) return undefined;
+	if (existsSync(input)) {
+		try {
+			return readFileSync(input, "utf-8");
+		} catch {
+			return input;
+		}
+	}
+	return input;
+}
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -159,6 +200,7 @@ program.parse();
  */
 async function run(opts: {
 	allowedTools?: string[];
+	appendSystemPrompt?: string;
 	continue?: boolean;
 	debug?: boolean;
 	demo?: boolean;
@@ -180,13 +222,20 @@ async function run(opts: {
 	resume?: string;
 	session?: boolean;
 	sessionId?: string;
+	systemPrompt?: string;
 	thinking?: string;
 	tools?: string;
 	worktree?: boolean;
+	yolo?: boolean;
 }): Promise<void> {
 	// Demo mode (set early — before --list and other output commands)
 	if (opts.demo) {
 		process.env.IS_DEMO = "1";
+	}
+
+	// Yolo mode — auto-approve confirmations (env var consumed by shell-policy + permissions)
+	if (opts.yolo) {
+		process.env.TALLOW_YOLO = "1";
 	}
 
 	// Quick info commands
@@ -260,8 +309,13 @@ async function run(opts: {
 		process.exit(1);
 	}
 
+	// Resolve --append-system-prompt / --system-prompt (supports file paths, matching pi behavior)
+	const resolvedAppendSystemPrompt = resolvePromptInput(opts.appendSystemPrompt);
+	const resolvedSystemPrompt = resolvePromptInput(opts.systemPrompt);
+
 	const sessionOpts: TallowSessionOptions = {
 		additionalExtensions: resolvedExtensionPaths.length > 0 ? resolvedExtensionPaths : undefined,
+		appendSystemPrompt: resolvedAppendSystemPrompt,
 		// apiKey resolved from TALLOW_API_KEY env var inside createTallowSession
 		extensionsOnly: opts.extensionsOnly,
 		modelId,
@@ -269,6 +323,7 @@ async function run(opts: {
 		noBundledSkills: opts.extensions === false,
 		plugins: opts.pluginDir,
 		provider,
+		systemPrompt: resolvedSystemPrompt,
 	};
 
 	let sessionWorktreePath: string | undefined;
@@ -282,6 +337,7 @@ async function run(opts: {
 			cleanupStaleSessionWorktrees(repoRoot);
 			sessionWorktreePath = createSessionWorktree(repoRoot);
 			sessionOpts.cwd = sessionWorktreePath;
+			process.chdir(sessionWorktreePath);
 			process.env.TALLOW_WORKTREE_PATH = sessionWorktreePath;
 			process.env.TALLOW_WORKTREE_ORIGINAL_CWD = originalCwd;
 		} catch (error) {
@@ -365,6 +421,13 @@ async function run(opts: {
 	 */
 	const cleanupSessionWorktree = (): void => {
 		if (!sessionWorktreePath) return;
+		const currentCwd = process.cwd();
+		if (
+			currentCwd === sessionWorktreePath ||
+			currentCwd.startsWith(`${sessionWorktreePath}${sep}`)
+		) {
+			process.chdir(originalCwd);
+		}
 		removeSessionWorktree(sessionWorktreePath, sessionWorktreeRepoRoot);
 		if (sessionWorktreeRepoRoot) {
 			try {
@@ -453,7 +516,59 @@ async function run(opts: {
 					const mode = new InteractiveMode(tallow.session, {
 						modelFallbackMessage: tallow.modelFallbackMessage,
 					});
-					await mode.run();
+					registerWorkspaceTransitionHost(
+						createInteractiveWorkspaceTransitionHost(
+							mode as unknown as Parameters<typeof createInteractiveWorkspaceTransitionHost>[0],
+							sessionOpts,
+							tallow.sessionId,
+							(session) => {
+								cleanupSessionRef.current = session;
+							}
+						)
+					);
+
+					// Relay server lets child processes (subagents, worktree runs)
+					// request workspace transitions through the parent TUI.
+					const cleanupRelay =
+						tryCreateTransitionRelayServer(
+							(): WorkspaceTransitionUI => {
+								try {
+									const modeAny = mode as unknown as Record<string, unknown>;
+									if (typeof modeAny.createExtensionUIContext === "function") {
+										const ctx = (
+											modeAny.createExtensionUIContext as () => Record<string, unknown>
+										)();
+										if (typeof ctx?.select === "function" && typeof ctx?.notify === "function") {
+											return {
+												select: ctx.select as WorkspaceTransitionUI["select"],
+												notify: ctx.notify as WorkspaceTransitionUI["notify"],
+												setWorkingMessage: (ctx.setWorkingMessage ??
+													(() => {})) as WorkspaceTransitionUI["setWorkingMessage"],
+											};
+										}
+									}
+								} catch {
+									// Fall through to auto-approve fallback.
+								}
+								return {
+									select: async (_title: string, options: string[]) => options[0],
+									notify: () => {},
+									setWorkingMessage: () => {},
+								};
+							},
+							(error) => {
+								console.warn(
+									`Warning: workspace-transition relay unavailable; child-process workspace transitions will be disabled for this session. ${error.message}`
+								);
+							}
+						)?.cleanup ?? (() => {});
+
+					try {
+						await mode.run();
+					} finally {
+						registerWorkspaceTransitionHost(null);
+						cleanupRelay();
+					}
 				}
 				break;
 			}

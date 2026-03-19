@@ -6,13 +6,17 @@
  * and permission denial detection.
  */
 
-import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { AgentToolResult } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import {
+	DEFAULT_AGENT_RUNNER_ENV,
+	spawnWithResolvedAgentRunner,
+} from "../../runtime/agent-runner.js";
+import { injectTraceContextToEnv, type TelemetryHandle } from "../../runtime/otel.js";
 import { extractPreview, isInlineResultsEnabled } from "../_shared/inline-preview.js";
 import {
 	emitWorktreeLifecycleEvent,
@@ -57,12 +61,37 @@ import {
 /** Reference to pi extension API, for sendMessage from async completion handlers. */
 let _piRef: ExtensionAPI | null = null;
 
+/** Session-scoped telemetry handle for trace context propagation. */
+let _telemetryHandle: TelemetryHandle | null = null;
+
 /**
  * Set the pi extension API reference for async completion handlers.
  * @param pi - Extension API reference
  */
 export function setPiRef(pi: ExtensionAPI | null): void {
 	_piRef = pi;
+}
+
+/**
+ * Set the telemetry handle for trace context propagation to child processes.
+ *
+ * @param handle - Telemetry handle from session, or null to clear
+ */
+export function setTelemetryHandle(handle: TelemetryHandle | null): void {
+	_telemetryHandle = handle;
+}
+
+/**
+ * Inject trace context into a child process environment when telemetry is active.
+ *
+ * @param env - Child process environment to mutate
+ */
+function injectTraceContextIfActive(env: Record<string, string>): void {
+	if (!_telemetryHandle?.enabled) return;
+	const carrier = _telemetryHandle.getTraceContext();
+	if (carrier) {
+		injectTraceContextToEnv(carrier, env);
+	}
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -677,7 +706,7 @@ export async function spawnBackgroundSubagent(
 		: ["--mode", "json", "-p", "--no-session"];
 	// Use provider-qualified name (e.g. "openai-codex/gpt-5.1") so the child process
 	// resolves to the exact provider the router selected, not just the first match.
-	if (agent.model) args.push("--models", routing.model.displayName);
+	if (agent.model) args.push("--model", routing.model.displayName);
 	const effectiveTools = computeEffectiveTools(agent.tools, agent.disallowedTools);
 	if (effectiveTools && effectiveTools.length > 0) args.push("--tools", effectiveTools.join(","));
 	if (agent.skills && agent.skills.length > 0) {
@@ -721,20 +750,26 @@ export async function spawnBackgroundSubagent(
 	if (agent.mcpServers && agent.mcpServers.length > 0) {
 		childEnv.PI_MCP_SERVERS = agent.mcpServers.join(",");
 	}
+	injectTraceContextIfActive(childEnv);
 
-	let proc: ReturnType<typeof spawn>;
-	try {
-		proc = spawn("pi", args, {
+	const backgroundSpawn = await spawnWithResolvedAgentRunner({
+		args,
+		runnerLabel: "Subagent",
+		resolution: {
+			overrideEnvVar: DEFAULT_AGENT_RUNNER_ENV,
+		},
+		spawnOptions: {
 			cwd: effectiveCwd,
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 			env: childEnv,
-		});
-	} catch (error) {
+		},
+	});
+	if (!backgroundSpawn.ok) {
 		cleanupIsolation("subagent", id, isolationContext, piEvents);
-		const reason = error instanceof Error ? error.message : String(error);
-		return `Failed to spawn background subagent ${agentName}: ${reason}`;
+		return `Failed to spawn background subagent ${agentName}: ${backgroundSpawn.reason}`;
 	}
+	const proc = backgroundSpawn.proc;
 
 	// Emit subagent_start event
 	piEvents?.emit("subagent_start", {
@@ -1093,7 +1128,7 @@ export async function runSingleAgent(
 		? ["--mode", "json", "-p", "--session", session]
 		: ["--mode", "json", "-p", "--no-session"];
 	// Use provider-qualified name so the child process resolves to the exact provider.
-	if (agent.model) args.push("--models", routing.model.displayName);
+	if (agent.model) args.push("--model", routing.model.displayName);
 	const fgEffectiveTools = computeEffectiveTools(agent.tools, agent.disallowedTools);
 	if (fgEffectiveTools && fgEffectiveTools.length > 0)
 		args.push("--tools", fgEffectiveTools.join(","));
@@ -1197,15 +1232,31 @@ export async function runSingleAgent(
 		if (agent.mcpServers && agent.mcpServers.length > 0) {
 			fgChildEnv.PI_MCP_SERVERS = agent.mcpServers.join(",");
 		}
+		injectTraceContextIfActive(fgChildEnv);
 
 		let fgTurnCount = 0;
-		const exitCode = await new Promise<number>((resolve) => {
-			const proc = spawn("pi", args, {
+		const foregroundSpawn = await spawnWithResolvedAgentRunner({
+			args,
+			runnerLabel: "Subagent",
+			resolution: {
+				overrideEnvVar: DEFAULT_AGENT_RUNNER_ENV,
+			},
+			spawnOptions: {
 				cwd: effectiveCwd,
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: fgChildEnv,
-			});
+			},
+		});
+		if (!foregroundSpawn.ok) {
+			throw new Error(foregroundSpawn.reason);
+		}
+		const exitCode = await new Promise<number>((resolve) => {
+			const proc = foregroundSpawn.proc;
+			if (!proc.stdout || !proc.stderr) {
+				resolve(1);
+				return;
+			}
 
 			let abortListener: (() => void) | null = null;
 			let buffer = "";

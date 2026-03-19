@@ -34,7 +34,7 @@ import {
 	type AgentRunnerCandidate,
 	formatMissingAgentRunnerError,
 	resolveAgentRunnerCandidates,
-} from "../../src/agent-runner.js";
+} from "../../runtime/agent-runner.js";
 import { isProjectTrusted } from "../_shared/project-trust.js";
 import { evaluateCommand } from "../_shared/shell-policy.js";
 import { getTallowHomeDir, getTallowPath } from "../_shared/tallow-paths.js";
@@ -75,6 +75,8 @@ export interface HookResult {
 	reason?: string;
 	additionalContext?: string;
 	decision?: "block" | "allow";
+	/** True when the hook failed due to infrastructure (missing cwd, spawn error), not a policy decision. */
+	infrastructureError?: boolean;
 }
 
 // Events that support blocking via hook decisions.
@@ -576,15 +578,33 @@ function mergeHooks(target: HooksConfig, source: HooksConfig): void {
  * Reads hooks from a JSON file (standalone hooks.json or settings.json with hooks key).
  * Returns null if the file doesn't exist or can't be parsed.
  */
+/**
+ * Check whether a parsed object contains any Claude Code event names as top-level keys.
+ *
+ * Used to detect hooks.json files that use Claude format (PreToolUse, UserPromptSubmit, etc.)
+ * instead of native tallow format (tool_call, input, etc.).
+ *
+ * @param obj - Parsed JSON object to inspect
+ * @returns True when at least one key is a known Claude event name
+ */
+export function hasClaudeEventKeys(obj: Record<string, unknown>): boolean {
+	return Object.keys(obj).some((key) => key in CLAUDE_EVENT_MAP);
+}
+
 function readHooksFile(filePath: string): HooksConfig | null {
 	try {
 		if (!fs.existsSync(filePath)) return null;
 		const content = JSON.parse(fs.readFileSync(filePath, "utf-8"));
 		// Standalone hooks.json has event keys at top level.
 		// settings.json wraps them under a "hooks" key.
+		// Also detect Claude event names (PreToolUse, etc.) as valid top-level keys.
 		return (
 			content.hooks ??
-			(content.tool_call || content.tool_result || content.agent_end ? content : null)
+			(content.tool_call || content.tool_result || content.agent_end
+				? content
+				: hasClaudeEventKeys(content)
+					? content
+					: null)
 		);
 	} catch {
 		return null;
@@ -604,7 +624,10 @@ function scanExtensionHooks(extensionsDir: string): HooksConfig {
 			const hooksPath = path.join(extensionsDir, entry, "hooks.json");
 			const hooks = readHooksFile(hooksPath);
 			if (hooks) {
-				mergeHooks(merged, hooks);
+				mergeHooks(
+					merged,
+					hasClaudeEventKeys(hooks) ? translateClaudeHooks(hooks, hooksPath) : hooks
+				);
 			}
 		}
 	} catch {
@@ -663,7 +686,9 @@ function getPackageHooks(settingsPath: string): HooksConfig[] {
 			const hooksFile = path.join(resolved, "hooks.json");
 			const hooks = readHooksFile(hooksFile);
 			if (hooks) {
-				results.push(hooks);
+				// Translate Claude event names if present, so packages can use
+				// either native tallow format or Claude Code format in hooks.json.
+				results.push(hasClaudeEventKeys(hooks) ? translateClaudeHooks(hooks, hooksFile) : hooks);
 			}
 		}
 	} catch {
@@ -684,7 +709,7 @@ function getPackageHooks(settingsPath: string): HooksConfig[] {
  *   5. .tallow/settings.json                    (project settings, trusted only)
  *   6. ~/.tallow/extensions/∗/hooks.json        (global extension hooks)
  *   7. .tallow/extensions/∗/hooks.json          (project extension hooks, trusted only)
- *   8. .claude/settings.json                    (project Claude hooks, translated)
+ *   8. .claude/settings.json                    (project Claude hooks, translated, trusted only)
  *   9. ~/.claude/settings.json                  (global Claude hooks, translated)
  *
  * All sources are merged additively — matchers are concatenated per event.
@@ -697,7 +722,7 @@ function getPackageHooks(settingsPath: string): HooksConfig[] {
 export function loadHooksConfig(cwd: string): HooksConfig {
 	const home = process.env.HOME || "";
 	const merged: HooksConfig = {};
-	const allowProjectSources = isProjectTrusted();
+	const allowProjectSources = isProjectTrusted(cwd);
 
 	// 1. Package hooks (lowest priority)
 	const globalSettingsPath = path.join(home, ".tallow", "settings.json");
@@ -738,10 +763,12 @@ export function loadHooksConfig(cwd: string): HooksConfig {
 	}
 
 	// 8. Claude project settings hooks (translated)
-	const claudeProjectPath = path.join(cwd, ".claude", "settings.json");
-	const claudeProjectSettings = readHooksFile(claudeProjectPath);
-	if (claudeProjectSettings) {
-		mergeHooks(merged, translateClaudeHooks(claudeProjectSettings, claudeProjectPath));
+	if (allowProjectSources) {
+		const claudeProjectPath = path.join(cwd, ".claude", "settings.json");
+		const claudeProjectSettings = readHooksFile(claudeProjectPath);
+		if (claudeProjectSettings) {
+			mergeHooks(merged, translateClaudeHooks(claudeProjectSettings, claudeProjectPath));
+		}
 	}
 
 	// 9. Claude global settings hooks (translated)
@@ -814,6 +841,16 @@ export async function runCommandHook(
 		};
 	}
 
+	// Pre-spawn guard: bail early if the working directory no longer exists.
+	// This catches the common case of a workspace rename/delete while the session is active.
+	if (!fs.existsSync(cwd)) {
+		return {
+			ok: false,
+			reason: `Hook cwd no longer exists: ${cwd}`,
+			infrastructureError: true,
+		};
+	}
+
 	const timeoutMs = (handler.timeout ?? 600) * 1000;
 	const maxBufferBytes = getHookOutputMaxBufferBytes();
 	const hookEventJson = JSON.stringify(eventData);
@@ -882,7 +919,18 @@ export async function runCommandHook(
 		}
 
 		proc.once("error", (error) => {
-			settle({ ok: false, reason: error.message || "Hook command failed to start" });
+			const spawnError = error as NodeJS.ErrnoException;
+			// Belt-and-suspenders: if the cwd was deleted between the pre-spawn
+			// check and the actual spawn(), detect it here via ENOENT.
+			const isCwdMissing = spawnError.code === "ENOENT" && !fs.existsSync(cwd);
+			const reason = isCwdMissing
+				? `Hook cwd no longer exists: ${cwd}`
+				: error.message || "Hook command failed to start";
+			settle({
+				ok: false,
+				reason,
+				infrastructureError: isCwdMissing || spawnError.code === "ENOENT",
+			});
 		});
 
 		proc.once("close", (code) => {
@@ -950,6 +998,15 @@ export async function runAgentHook(
 	agentsDir: string,
 	signal?: AbortSignal
 ): Promise<HookResult> {
+	// Pre-spawn guard: bail early if the working directory no longer exists.
+	if (!fs.existsSync(cwd)) {
+		return {
+			ok: false,
+			reason: `Hook cwd no longer exists: ${cwd}`,
+			infrastructureError: true,
+		};
+	}
+
 	const timeoutMs = (handler.timeout ?? 60) * 1000;
 	const maxBufferBytes = getHookOutputMaxBufferBytes();
 
@@ -1123,6 +1180,9 @@ export default function (pi: ExtensionAPI) {
 	let currentCwd = "";
 	let ctx: ExtensionContext | null = null;
 	let stateManager: HookStateManager | null = null;
+
+	/** Tracks whether the stale-cwd warning has been shown this session. */
+	let staleCwdWarningShown = false;
 
 	// Pending async hook results to deliver on next turn
 	const pendingAsyncResults: Array<{ event: string; result: HookResult }> = [];
@@ -1443,7 +1503,22 @@ export default function (pi: ExtensionAPI) {
 						additionalContext = `${(additionalContext || "") + result.additionalContext}\n`;
 					}
 
-					if (!result.ok && canBlock) {
+					// Surface a user-visible warning once per session when hooks are
+					// skipped due to infrastructure errors (e.g. workspace renamed).
+					if (result.infrastructureError && !staleCwdWarningShown) {
+						staleCwdWarningShown = true;
+						ctx?.ui?.notify(
+							`⚠️ Hook skipped: workspace directory no longer exists (${currentCwd}). ` +
+								`Use /cd to switch to the new location.`,
+							"warning"
+						);
+					}
+
+					// Block only on deliberate policy decisions (decision: "block" or
+					// exit code 2), never on infrastructure errors (missing cwd, spawn
+					// failure). Infrastructure errors still produce ok: false so callers
+					// know the hook didn't succeed, but they must not freeze the session.
+					if (!result.ok && canBlock && !result.infrastructureError) {
 						shouldBlock = true;
 						blockReason = result.reason;
 						break; // First blocking hook wins

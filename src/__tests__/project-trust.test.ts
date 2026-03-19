@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	applyProjectTrustContextToEnv,
 	computeProjectFingerprint,
+	getCanonicalCwd,
 	getProjectTrustStatusFromEnv,
 	resolveProjectTrust,
 	trustProject,
@@ -33,6 +34,18 @@ afterEach(() => {
 	rmSync(trustDir, { recursive: true, force: true });
 });
 
+/**
+ * Read the persisted trust store fixture from disk.
+ *
+ * @returns Parsed trust store JSON
+ */
+function readPersistedTrustStore(): Record<string, Record<string, unknown>> {
+	return JSON.parse(readFileSync(join(trustDir, "projects.json"), "utf-8")) as Record<
+		string,
+		Record<string, unknown>
+	>;
+}
+
 describe("project trust lifecycle", () => {
 	test("starts untrusted when no trust entry exists", () => {
 		const trust = resolveProjectTrust(projectDir);
@@ -47,6 +60,42 @@ describe("project trust lifecycle", () => {
 		const resolved = resolveProjectTrust(projectDir);
 		expect(resolved.status).toBe("trusted");
 		expect(resolved.storedFingerprint).toBe(resolved.fingerprint);
+
+		const persistedStore = readPersistedTrustStore();
+		expect(persistedStore[getCanonicalCwd(projectDir)]).toEqual({
+			fingerprint: resolved.fingerprint,
+			trustedAt: expect.any(String),
+			version: expect.any(Number),
+		});
+	});
+
+	test("migrates legacy trusted entries instead of marking them stale", () => {
+		const trustedAt = "2026-03-09T03:13:00.000Z";
+		const canonicalProjectDir = getCanonicalCwd(projectDir);
+		writeFileSync(
+			join(trustDir, "projects.json"),
+			JSON.stringify(
+				{
+					[canonicalProjectDir]: {
+						fingerprint: "legacy-fingerprint",
+						trustedAt,
+					},
+				},
+				null,
+				"\t"
+			)
+		);
+
+		const resolved = resolveProjectTrust(projectDir);
+		expect(resolved.status).toBe("trusted");
+		expect(resolved.storedFingerprint).toBe(resolved.fingerprint);
+
+		const persistedStore = readPersistedTrustStore();
+		expect(persistedStore[canonicalProjectDir]).toEqual({
+			fingerprint: resolved.fingerprint,
+			trustedAt,
+			version: expect.any(Number),
+		});
 	});
 
 	test("fingerprint changes invalidate trust", () => {
@@ -109,6 +158,51 @@ describe("fingerprint scope", () => {
 		);
 		const b = computeProjectFingerprint(projectDir);
 		expect(a).toBe(b);
+	});
+
+	test("includes trusted Claude compatibility settings", () => {
+		mkdirSync(join(projectDir, ".claude"), { recursive: true });
+		writeFileSync(
+			join(projectDir, ".claude", "settings.json"),
+			JSON.stringify({ permissions: { deny: ["Bash(ssh *)"] } })
+		);
+		const a = computeProjectFingerprint(projectDir);
+
+		writeFileSync(
+			join(projectDir, ".claude", "settings.json"),
+			JSON.stringify({ permissions: { deny: ["Bash(curl *)"] } })
+		);
+		const b = computeProjectFingerprint(projectDir);
+		expect(a).not.toBe(b);
+	});
+
+	test("includes trusted project agent directories", () => {
+		mkdirSync(join(projectDir, ".tallow", "agents"), { recursive: true });
+		writeFileSync(
+			join(projectDir, ".tallow", "agents", "reviewer.md"),
+			"---\nname: reviewer\ndescription: review code\n---\nReview carefully.\n"
+		);
+		const a = computeProjectFingerprint(projectDir);
+
+		writeFileSync(
+			join(projectDir, ".tallow", "agents", "reviewer.md"),
+			"---\nname: reviewer\ndescription: review code\n---\nReview aggressively.\n"
+		);
+		const b = computeProjectFingerprint(projectDir);
+		expect(a).not.toBe(b);
+	});
+
+	test("includes trusted project prompts and rules", () => {
+		mkdirSync(join(projectDir, ".tallow", "prompts"), { recursive: true });
+		mkdirSync(join(projectDir, ".tallow", "rules"), { recursive: true });
+		writeFileSync(join(projectDir, ".tallow", "prompts", "review.md"), "Prompt v1\n");
+		writeFileSync(join(projectDir, ".tallow", "rules", "rule.md"), "Rule v1\n");
+		const a = computeProjectFingerprint(projectDir);
+
+		writeFileSync(join(projectDir, ".tallow", "prompts", "review.md"), "Prompt v2\n");
+		writeFileSync(join(projectDir, ".tallow", "rules", "rule.md"), "Rule v2\n");
+		const b = computeProjectFingerprint(projectDir);
+		expect(a).not.toBe(b);
 	});
 });
 

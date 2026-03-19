@@ -10,7 +10,7 @@
 
 <p align="center">
   <a href="https://github.com/dungle-scrubs/tallow/actions/workflows/ci.yml">CI</a> ·
-  <a href="https://www.npmjs.com/package/tallow">npm</a> ·
+  <a href="https://www.npmjs.com/package/@dungle-scrubs/tallow">npm</a> ·
   <a href="https://tallow.dungle-scrubs.com">Docs</a> ·
   <a href="https://opensource.org/licenses/MIT">MIT</a>
 </p>
@@ -18,22 +18,16 @@
 ---
 
 Tallow is a terminal coding agent that starts minimal and scales up. Install only the
-extensions, themes, and agents your project needs, or enable everything. It drops into
+extensions, themes, and agent templates your project needs, or enable everything. It drops into
 existing Claude Code projects via `.claude/` bridging, so nothing breaks when you switch.
-Ships with 51 extensions, 34 themes, and 10 specialized agents.
+Ships with 52 extensions, 34 themes, and 9 bundled agent templates.
 
 ## Quick start
 
 ```bash
-npm install -g tallow   # or: pnpm add -g tallow / bun install -g tallow
-tallow install          # pick extensions, themes, agents
+bun add -g @dungle-scrubs/tallow
+tallow install          # pick extensions, themes, agent templates
 tallow                  # start coding
-```
-
-Or try it without installing globally:
-
-```bash
-npx tallow install      # or: pnpm dlx tallow install / bunx tallow install
 ```
 
 > Requires Node.js ≥ 22 and an API key for at least one LLM provider
@@ -50,8 +44,8 @@ bun run build
 node dist/install-flow.js
 ```
 
-The installer walks you through selecting extensions, themes, and agents,
-then links the `tallow` binary globally.
+The installer walks you through selecting extensions, themes, and agent templates,
+then writes config and starter templates into `~/.tallow/`.
 
 </details>
 
@@ -68,8 +62,8 @@ multiple models in parallel.
 **Context fork** — Branch into an isolated subprocess with its own tools and model,
 then merge results back into the main session.
 
-**Workspace rewind** — Every conversation turn snapshots your file changes. Roll back
-to any earlier turn when something goes wrong.
+**Workspace rewind** — Every conversation turn snapshots tracked and unignored file
+changes. Roll back to any earlier turn when something goes wrong.
 
 **Background tasks** — Kick off long-running work without blocking the session.
 Track task lifecycle explicitly and check back when ready.
@@ -212,13 +206,31 @@ await session.prompt("What files are in this directory?");
 session.dispose();
 ```
 
+#### OpenTelemetry tracing
+
+Opt-in distributed tracing for SDK consumers (e.g. marrow):
+
+```typescript
+import { NodeTracerProvider } from "@opentelemetry/sdk-trace-node";
+import { createTallowSession } from "tallow";
+
+const provider = new NodeTracerProvider();
+const { session } = await createTallowSession({
+  telemetry: { tracerProvider: provider },
+});
+// Spans: tallow.session.create, tallow.prompt, tallow.tool.call, ...
+```
+
+CLI subprocesses propagate `TRACEPARENT`/`TRACESTATE` automatically when
+telemetry is enabled. Zero overhead when disabled.
+
 See the [SDK docs](https://tallow.dungle-scrubs.com) for all options.
 
 ## Known limitations
 
 - Requires Node.js 22+ (uses modern ESM features)
 - Session persistence is local — no cloud sync
-- `web_fetch` works best with a [Firecrawl](https://firecrawl.dev) API key for JS-heavy pages
+- `web_fetch` is plain HTTP by default; for bot-guarded or JS-heavy pages it can opt in to the published `dendrite-scraper` package when `dendrite-scraper` or `uvx` is available
 
 ## Contributing
 

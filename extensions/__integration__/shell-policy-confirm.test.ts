@@ -21,6 +21,7 @@ import {
 	enforceExplicitPolicy,
 	getAuditTrail,
 	resetPermissionCache,
+	type ShellConfirmResponse,
 } from "../_shared/shell-policy.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -75,12 +76,18 @@ function createPolicyExtension(confirmBehavior: "accept" | "deny" | "throw"): Ex
 			const command = (event.input as { command?: string }).command;
 			if (!command) return;
 
-			return enforceExplicitPolicy(command, "bash", ctx.cwd, true, async () => {
-				if (confirmBehavior === "throw") {
-					throw new Error("Confirmation interrupted");
+			return enforceExplicitPolicy(
+				command,
+				"bash",
+				ctx.cwd,
+				true,
+				async (): Promise<ShellConfirmResponse> => {
+					if (confirmBehavior === "throw") {
+						throw new Error("Confirmation interrupted");
+					}
+					return confirmBehavior === "accept" ? "yes" : "no";
 				}
-				return confirmBehavior === "accept";
-			});
+			);
 		});
 	};
 }
@@ -176,6 +183,7 @@ describe("Shell Policy Confirm — denied high-risk", () => {
 describe("Shell Policy Confirm — permission-rule denial messaging", () => {
 	it("blocks execution with actionable permission reason", async () => {
 		const cwd = mkdtempSync(join(tmpdir(), "tallow-shell-perm-int-"));
+		const originalTrustCwd = process.env.TALLOW_PROJECT_TRUST_CWD;
 		const originalTrustStatus = process.env.TALLOW_PROJECT_TRUST_STATUS;
 		try {
 			mkdirSync(join(cwd, ".tallow"), { recursive: true });
@@ -188,9 +196,9 @@ describe("Shell Policy Confirm — permission-rule denial messaging", () => {
 					},
 				})
 			);
+			process.env.TALLOW_PROJECT_TRUST_CWD = cwd;
 			process.env.TALLOW_PROJECT_TRUST_STATUS = "trusted";
 			resetPermissionCache();
-
 			const [toolResults, resultTracker] = createResultTracker();
 
 			const permissionAwarePolicy: ExtensionFactory = (pi: ExtensionAPI): void => {
@@ -199,8 +207,15 @@ describe("Shell Policy Confirm — permission-rule denial messaging", () => {
 					if (event.toolName !== "bash") return;
 					const command = (event.input as { command?: string }).command;
 					if (!command) return;
+					process.env.TALLOW_PROJECT_TRUST_CWD = ctx.cwd;
 					process.env.TALLOW_PROJECT_TRUST_STATUS = "trusted";
-					return enforceExplicitPolicy(command, "bash", ctx.cwd, true, async () => true);
+					return enforceExplicitPolicy(
+						command,
+						"bash",
+						ctx.cwd,
+						true,
+						async (): Promise<ShellConfirmResponse> => "yes"
+					);
 				});
 			};
 
@@ -222,6 +237,11 @@ describe("Shell Policy Confirm — permission-rule denial messaging", () => {
 			);
 			expect(blocked.some((e) => e.reason?.includes(".tallow/settings.json"))).toBe(true);
 		} finally {
+			if (originalTrustCwd !== undefined) {
+				process.env.TALLOW_PROJECT_TRUST_CWD = originalTrustCwd;
+			} else {
+				delete process.env.TALLOW_PROJECT_TRUST_CWD;
+			}
 			if (originalTrustStatus !== undefined) {
 				process.env.TALLOW_PROJECT_TRUST_STATUS = originalTrustStatus;
 			} else {
@@ -277,10 +297,16 @@ describe("Shell Policy Confirm — denylist bypass", () => {
 				const command = (event.input as { command?: string }).command;
 				if (!command) return;
 
-				return enforceExplicitPolicy(command, "bash", ctx.cwd, true, async () => {
-					confirmCalled = true;
-					return true;
-				});
+				return enforceExplicitPolicy(
+					command,
+					"bash",
+					ctx.cwd,
+					true,
+					async (): Promise<ShellConfirmResponse> => {
+						confirmCalled = true;
+						return "yes";
+					}
+				);
 			});
 		};
 
@@ -329,7 +355,13 @@ describe("Shell Policy Confirm — handler ordering", () => {
 				const command = (event.input as { command?: string }).command;
 				if (!command) return;
 
-				return enforceExplicitPolicy(command, "bash", ctx.cwd, true, async () => true);
+				return enforceExplicitPolicy(
+					command,
+					"bash",
+					ctx.cwd,
+					true,
+					async (): Promise<ShellConfirmResponse> => "yes"
+				);
 			});
 		};
 
@@ -379,7 +411,13 @@ describe("Shell Policy Confirm — handler ordering", () => {
 				const command = (event.input as { command?: string }).command;
 				if (!command) return;
 
-				return enforceExplicitPolicy(command, "bash", ctx.cwd, true, async () => true);
+				return enforceExplicitPolicy(
+					command,
+					"bash",
+					ctx.cwd,
+					true,
+					async (): Promise<ShellConfirmResponse> => "yes"
+				);
 			});
 		};
 

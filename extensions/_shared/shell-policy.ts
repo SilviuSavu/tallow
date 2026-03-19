@@ -15,9 +15,10 @@
  */
 
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
+import { atomicWriteFileSync } from "./atomic-write.js";
 import {
 	type ExpansionVars,
 	evaluate as evaluatePermission,
@@ -132,9 +133,15 @@ const ALWAYS_BLOCK_PATTERNS: readonly RegExp[] = [
 	),
 ];
 
-/** High-risk patterns: explicit sources require confirmation. */
+/** High-risk patterns: explicit sources require confirmation.
+ *
+ * NOTE: `rm -r` is intentionally absent. Catastrophic rm targets (/, ~, ., ..)
+ * are hard-denied by ALWAYS_BLOCK_PATTERNS above. Non-catastrophic recursive
+ * deletes (build dirs, caches, project subdirs) are normal dev workflow and
+ * should not prompt. Additional rm guardrails live in tallow-plugins hooks
+ * (rm_protection.py) which do proper token-parsed analysis.
+ */
 const HIGH_RISK_PATTERNS: readonly RegExp[] = [
-	new RegExp(`${COMMAND_SEGMENT_PREFIX}rm\\s+-\\w*r\\w*`, "i"),
 	new RegExp(`${COMMAND_SEGMENT_PREFIX}sudo\\b`, "i"),
 	new RegExp(`${COMMAND_SEGMENT_PREFIX}curl\\b[^\\n|]*\\|\\s*(?:ba)?sh\\b`, "i"),
 	new RegExp(`${COMMAND_SEGMENT_PREFIX}wget\\b[^\\n|]*\\|\\s*(?:ba)?sh\\b`, "i"),
@@ -171,6 +178,101 @@ const INTERNAL_COMMAND_ALLOWLIST = new Set(["git", "gh", "which"]);
 const auditTrail: ShellAuditEntry[] =
 	((globalThis as Record<string, unknown>).__piShellAuditTrail as ShellAuditEntry[]) ?? [];
 (globalThis as Record<string, unknown>).__piShellAuditTrail = auditTrail;
+
+// ── Pattern Derivation ───────────────────────────────────────────────────────
+
+/**
+ * High-risk patterns eligible for "Always allow" exact-command rules.
+ *
+ * These are the unanchored variants of HIGH_RISK_PATTERNS, used to detect
+ * high-risk command families in trimmed command text. When a command matches,
+ * `deriveAllowPattern` returns the exact command as a `Bash(...)` allow rule
+ * rather than a wildcard pattern.
+ */
+const HIGH_RISK_ALLOW_PATTERNS: readonly RegExp[] = [
+	/\bsudo\b/i,
+	/\bcurl\b[^\n|]*\|\s*(?:ba)?sh\b/i,
+	/\bwget\b[^\n|]*\|\s*(?:ba)?sh\b/i,
+	/\bchmod\s+-R\s+777\b/i,
+	/\bchown\s+-R\s+root\b/i,
+	/\bgit\s+reset\s+--hard\b/i,
+	/\bgit\s+clean\s+-f/i,
+	/\bdd\s+if\s*=/i,
+];
+
+/**
+ * Derive a `Bash(command)` allow rule from a high-risk command.
+ *
+ * Matches the command against known high-risk patterns and returns an
+ * exact-command allow rule. This ensures that approving one specific
+ * high-risk command (e.g. `rm -rf ./dist`) does not blanket-approve
+ * all commands in that family (e.g. all `rm -rf` commands).
+ *
+ * @param command - Raw command text
+ * @returns Derived `Bash(<exact-command>)` rule string, or null if no pattern matches
+ */
+export function deriveAllowPattern(command: string): string | null {
+	const trimmed = command.trim();
+	for (const pattern of HIGH_RISK_ALLOW_PATTERNS) {
+		if (pattern.test(trimmed)) {
+			return `Bash(${trimmed})`;
+		}
+	}
+	return null;
+}
+
+// ── Settings Write ───────────────────────────────────────────────────────────
+
+/**
+ * Add a permission allow rule to a settings.json file.
+ *
+ * Reads the existing file (or creates a new one), ensures the
+ * `permissions.allow` array exists, deduplicates, and writes atomically.
+ *
+ * @param rule - Permission rule string (e.g. `Bash(rm -rf *)`)
+ * @param settingsPath - Absolute path to settings.json
+ * @returns void
+ */
+export function addPermissionAllowRule(rule: string, settingsPath: string): void {
+	let settings: Record<string, unknown> = {};
+	if (existsSync(settingsPath)) {
+		try {
+			const raw = readFileSync(settingsPath, "utf-8");
+			const parsed = JSON.parse(raw);
+			if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+				settings = parsed as Record<string, unknown>;
+			}
+		} catch {
+			// Malformed JSON — start fresh but preserve nothing
+			settings = {};
+		}
+	}
+
+	// Ensure permissions.allow array exists
+	if (!settings.permissions || typeof settings.permissions !== "object") {
+		settings.permissions = {};
+	}
+	const perms = settings.permissions as Record<string, unknown>;
+	if (!Array.isArray(perms.allow)) {
+		perms.allow = [];
+	}
+	const allowList = perms.allow as string[];
+
+	// Deduplicate
+	if (allowList.includes(rule)) {
+		return;
+	}
+
+	allowList.push(rule);
+
+	// Ensure parent directory exists
+	const dir = dirname(settingsPath);
+	if (!existsSync(dir)) {
+		mkdirSync(dir, { recursive: true });
+	}
+
+	atomicWriteFileSync(settingsPath, `${JSON.stringify(settings, null, "\t")}\n`);
+}
 
 /** Callback for the pharma-grade audit trail extension. */
 type AuditTrailCallback = (entry: ShellAuditEntry) => void;
@@ -470,7 +572,7 @@ export function isShellInterpolationEnabled(cwd: string = process.cwd()): boolea
 	if (process.env.TALLOW_SHELL_INTERPOLATION === "1") return true;
 
 	const globalSettingsPath = getTallowSettingsPath();
-	const settingsPaths = isProjectTrusted()
+	const settingsPaths = isProjectTrusted(cwd)
 		? [join(cwd, ".tallow", "settings.json"), globalSettingsPath]
 		: [globalSettingsPath];
 
@@ -518,6 +620,19 @@ function readShellInterpolationSetting(settingsPath: string): boolean | null {
  */
 export function isNonInteractiveBypassEnabled(): boolean {
 	return process.env.TALLOW_ALLOW_UNSAFE_SHELL === "1";
+}
+
+/**
+ * Check whether yolo mode is active.
+ *
+ * Yolo mode auto-approves all confirmation prompts (high-risk commands,
+ * ask-tier permission rules) but keeps hard denies (fork bombs, rm -rf /,
+ * mkfs, etc.) intact.
+ *
+ * @returns True when TALLOW_YOLO=1
+ */
+export function isYoloMode(): boolean {
+	return process.env.TALLOW_YOLO === "1";
 }
 
 /**
@@ -707,14 +822,25 @@ export function evaluateCommand(
 	};
 }
 
+/** User response from a shell policy confirmation dialog. */
+export type ShellConfirmResponse = "yes" | "no" | "always" | undefined;
+
 /**
  * Enforce explicit-command policy for bash/bg_bash tool calls.
+ *
+ * The confirmFn receives the prompt message and an optional derived allow-rule
+ * pattern (present only for high-risk built-in matches, not for user-configured
+ * ask-tier rules). It returns a {@link ShellConfirmResponse}.
+ *
+ * When the user selects "always", the derived pattern is persisted to
+ * `~/.tallow/settings.json` → `permissions.allow[]` and the permission cache
+ * is reloaded so the rule takes effect immediately.
  *
  * @param command - Command text
  * @param source - Explicit source (bash or bg_bash)
  * @param cwd - Working directory
  * @param interactive - Whether interactive confirmation is available
- * @param confirmFn - Confirmation callback for high-risk commands
+ * @param confirmFn - Confirmation callback returning user's choice
  * @returns Block object when denied, otherwise undefined
  */
 export async function enforceExplicitPolicy(
@@ -722,7 +848,7 @@ export async function enforceExplicitPolicy(
 	source: "bash" | "bg_bash",
 	cwd: string,
 	interactive: boolean,
-	confirmFn: (message: string) => Promise<boolean | undefined>
+	confirmFn: (message: string, derivedPattern: string | null) => Promise<ShellConfirmResponse>
 ): Promise<{ block: true; reason: string } | undefined> {
 	const verdict = evaluateCommand(command, source, cwd);
 	if (!verdict.allowed) {
@@ -746,6 +872,20 @@ export async function enforceExplicitPolicy(
 			trustLevel: verdict.trustLevel,
 			cwd,
 			outcome: "allowed",
+		});
+		return undefined;
+	}
+
+	// Yolo mode: auto-approve confirmation prompts (hard denies already blocked above)
+	if (isYoloMode()) {
+		recordAudit({
+			timestamp: Date.now(),
+			command: verdict.normalizedCommand,
+			source,
+			trustLevel: verdict.trustLevel,
+			cwd,
+			outcome: "bypassed",
+			reason: "yolo mode",
 		});
 		return undefined;
 	}
@@ -786,16 +926,24 @@ export async function enforceExplicitPolicy(
 		return undefined;
 	}
 
+	// Derive an allow-rule pattern only for built-in high-risk matches.
+	// User-configured ask-tier rules must not be auto-whitelistable.
+	const derivedPattern =
+		verdict.reasonCode === "high_risk_command"
+			? deriveAllowPattern(verdict.normalizedCommand)
+			: null;
+
 	const promptReason = verdict.reason ? `${verdict.reason}\n\n` : "";
 	const promptTitle =
 		verdict.reasonCode === "rule_requires_confirmation"
 			? "Permission confirmation required"
 			: "High-risk shell command detected";
 
-	let confirmed: boolean | undefined;
+	let response: ShellConfirmResponse;
 	try {
-		confirmed = await confirmFn(
-			`${promptTitle}:\n\n${promptReason}${verdict.normalizedCommand}\n\nRun this command?`
+		response = await confirmFn(
+			`${promptTitle}:\n\n${promptReason}${verdict.normalizedCommand}\n\nRun this command?`,
+			derivedPattern
 		);
 	} catch (error) {
 		const reason =
@@ -814,34 +962,50 @@ export async function enforceExplicitPolicy(
 		return { block: true, reason };
 	}
 
-	if (confirmed !== true) {
-		const reason =
-			confirmed === false
-				? verdict.reasonCode === "rule_requires_confirmation"
-					? "User denied permission confirmation"
-					: "User denied high-risk command"
-				: "Confirmation was canceled";
+	if (response === "always" && derivedPattern) {
+		const settingsPath = getTallowSettingsPath();
+		addPermissionAllowRule(derivedPattern, settingsPath);
+		reloadPermissions(cwd);
 		recordAudit({
 			timestamp: Date.now(),
 			command: verdict.normalizedCommand,
 			source,
 			trustLevel: verdict.trustLevel,
 			cwd,
-			outcome: "blocked",
-			reason,
+			outcome: "confirmed",
+			reason: `always_allow_persisted: ${derivedPattern}`,
 		});
-		return { block: true, reason };
+		return undefined;
 	}
 
+	if (response === "yes") {
+		recordAudit({
+			timestamp: Date.now(),
+			command: verdict.normalizedCommand,
+			source,
+			trustLevel: verdict.trustLevel,
+			cwd,
+			outcome: "confirmed",
+		});
+		return undefined;
+	}
+
+	const reason =
+		response === "no"
+			? verdict.reasonCode === "rule_requires_confirmation"
+				? "User denied permission confirmation"
+				: "User denied high-risk command"
+			: "Confirmation was canceled";
 	recordAudit({
 		timestamp: Date.now(),
 		command: verdict.normalizedCommand,
 		source,
 		trustLevel: verdict.trustLevel,
 		cwd,
-		outcome: "confirmed",
+		outcome: "blocked",
+		reason,
 	});
-	return undefined;
+	return { block: true, reason };
 }
 
 /**

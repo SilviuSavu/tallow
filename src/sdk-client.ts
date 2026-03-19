@@ -29,8 +29,24 @@ import {
 import * as PiTui from "@mariozechner/pi-tui";
 import { atomicWriteFileSync } from "./atomic-write.js";
 import { createSecureAuthStorage, resolveRuntimeApiKeyFromEnv } from "./auth-hardening.js";
-import { BUNDLED, bootstrap, resolveOpSecrets, TALLOW_HOME, TALLOW_VERSION } from "./app-config.js";
+import { applyAgentSessionCompactionCancelPatch } from "./compaction-cancel-patch.js";
+import {
+	BUNDLED,
+	bootstrap,
+	getRuntimeTallowHome,
+	resolveOpSecrets,
+	TALLOW_HOME,
+	TALLOW_VERSION,
+} from "./app-config.js";
 import { applyInteractiveModeStaleUiPatch } from "./interactive-mode-patch.js";
+import {
+	createTelemetryHandle,
+	extractTraceContextFromEnv,
+	sessionAttributes,
+	type TallowTelemetryConfig,
+	TELEMETRY_API_CHANNELS,
+	type TelemetryHandle,
+} from "./otel.js";
 import { cleanupOrphanPids } from "./pid-manager.js";
 import {
 	extractClaudePluginResources,
@@ -48,10 +64,12 @@ import {
 	untrustProject,
 } from "./project-trust.js";
 import { buildProjectTrustBannerPayload } from "./project-trust-banner.js";
+import { PROJECT_TRUST_API_CHANNELS } from "./project-trust-interop.js";
 import { migrateSessionsToPerCwdDirs } from "./session-migration.js";
 import { createSessionWithId, findSessionById } from "./session-utils.js";
 import { normalizeStartupProfile, type StartupProfile } from "./startup-profile.js";
 import { emitStartupTiming, isStartupTimingEnabled } from "./startup-timing.js";
+import { applyStreamingYieldPatch } from "./streaming-yield-patch.js";
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -136,10 +154,26 @@ export interface TallowSessionOptions {
 
 	/** Settings overrides */
 	settings?: Record<string, unknown>;
+
+	/**
+	 * OpenTelemetry configuration for distributed tracing.
+	 *
+	 * When provided, tallow emits `tallow.*` spans for session lifecycle,
+	 * model calls, tool execution, subagent runs, and teammate sessions.
+	 * All span attributes are metadata-only — no prompt text, tool payloads,
+	 * or secrets are captured.
+	 *
+	 * Requires `@opentelemetry/api` (peer dependency). When omitted,
+	 * telemetry is completely disabled with zero runtime overhead.
+	 */
+	telemetry?: TallowTelemetryConfig;
 }
 
 /** Marker key used on summarized historical tool results. */
 export const TOOL_RESULT_RETENTION_MARKER = "__tallow_summarized_tool_result__";
+
+/** Marker key used on ingestion-time budget-guarded tool results. */
+export const TOOL_RESULT_BUDGET_GUARD_MARKER = "__tallow_budget_guard__";
 
 /** Default retention policy for historical tool-result payloads. */
 const DEFAULT_TOOL_RESULT_RETENTION_POLICY = {
@@ -155,6 +189,69 @@ export interface ToolResultRetentionPolicy {
 	readonly keepRecentToolResults: number;
 	readonly maxRetainedBytesPerResult: number;
 	readonly previewChars: number;
+}
+
+// ─── Context Budget Policy ───────────────────────────────────────────────────
+
+/** Default context-budget thresholds and caps. */
+const DEFAULT_CONTEXT_BUDGET_POLICY = {
+	softThresholdPercent: 75,
+	hardThresholdPercent: 90,
+	minPerToolBytes: 4 * 1024,
+	maxPerToolBytes: 512 * 1024,
+	perTurnReserveTokens: 8_000,
+	unknownUsageFallbackCapBytes: 32 * 1024,
+} as const;
+
+/** Event channels for context-budget planner ↔ tool API handshake. */
+const CONTEXT_BUDGET_API_CHANNELS = {
+	budgetApi: "interop.api.v1.context-budget.api",
+	budgetApiRequest: "interop.api.v1.context-budget.api-request",
+} as const;
+
+/** Default TTL for per-tool context-budget envelopes. */
+const CONTEXT_BUDGET_ENVELOPE_TTL_MS = 30_000;
+
+/** Resolved policy controlling context-budget guardrails. */
+export interface ContextBudgetPolicy {
+	/** Percentage of context window at which soft budget warnings begin. */
+	readonly softThresholdPercent: number;
+	/** Percentage of context window at which hard budget caps apply. */
+	readonly hardThresholdPercent: number;
+	/** Minimum bytes a single tool call is always allowed. */
+	readonly minPerToolBytes: number;
+	/** Maximum bytes a single tool call may receive. */
+	readonly maxPerToolBytes: number;
+	/** Tokens reserved each turn for the model's response. */
+	readonly perTurnReserveTokens: number;
+	/** Byte cap applied when context usage is unknown (post-compaction). */
+	readonly unknownUsageFallbackCapBytes: number;
+}
+
+/** Optional settings payload accepted from settings.json / overrides. */
+interface ContextBudgetConfigInput {
+	readonly softThresholdPercent?: unknown;
+	readonly hardThresholdPercent?: unknown;
+	readonly minPerToolBytes?: unknown;
+	readonly maxPerToolBytes?: unknown;
+	readonly perTurnReserveTokens?: unknown;
+	readonly unknownUsageFallbackCapBytes?: unknown;
+}
+
+/** Minimal context-usage snapshot used by budget helpers. */
+export interface ContextUsageSnapshot {
+	readonly tokens: number | null;
+	readonly contextWindow: number;
+	readonly percent: number | null;
+}
+
+/** Metadata attached to budget-guarded tool results under a namespaced key. */
+interface BudgetGuardMetadata {
+	readonly [key: string]: unknown;
+	readonly guardedAt: string;
+	readonly originalContentBytes: number;
+	readonly truncatedToBytes: number;
+	readonly reason: "over_budget" | "unknown_usage";
 }
 
 /** Optional settings payload accepted from settings.json / overrides. */
@@ -191,6 +288,14 @@ interface ToolResultPayloadBytes {
 	readonly contentBytes: number;
 	readonly detailsBytes: number;
 	readonly totalBytes: number;
+}
+
+/** Output from ingestion-time budget guarding for tool-result content. */
+interface GuardedToolResultContent {
+	readonly content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>;
+	readonly originalTextBytes: number;
+	readonly truncatedToBytes: number;
+	readonly wasGuarded: boolean;
 }
 
 /** Aggregate stats from a retention pass over historical tool results. */
@@ -277,6 +382,94 @@ export function parseToolFlag(toolString: string): ToolArray {
 }
 
 /**
+ * Extract tool names from a tool-definition array.
+ *
+ * @param tools - Tool definitions from session options
+ * @returns Sorted unique tool names
+ */
+function extractToolNames(tools: readonly unknown[] | undefined): string[] {
+	if (!tools) return [];
+	const names = new Set<string>();
+	for (const tool of tools) {
+		const name = (tool as { name?: unknown }).name;
+		if (typeof name === "string" && name.length > 0) {
+			names.add(name);
+		}
+	}
+	return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Resolve the explicit tool names allowed for this session.
+ *
+ * When the caller passes `options.tools`, tallow treats that as the complete
+ * tool allowlist. Explicit custom tools are included because the caller opted
+ * into them directly.
+ *
+ * @param options - Session options being used to create the session
+ * @returns Allowed tool names, or null when no explicit allowlist was provided
+ */
+function resolveExplicitToolRestrictionNames(options: TallowSessionOptions): string[] | null {
+	if (options.tools === undefined) return null;
+	const names = new Set<string>(extractToolNames(options.tools));
+	for (const name of extractToolNames(options.customTools)) {
+		names.add(name);
+	}
+	return [...names].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * Create a built-in extension that enforces an explicit session tool allowlist.
+ *
+ * This closes the gap where extension-registered tools could remain active even
+ * when the caller requested `--tools readonly` or `--tools none`.
+ *
+ * @param allowedToolNames - Tool names allowed for the session
+ * @returns Extension factory
+ */
+function createExplicitToolRestrictionExtension(
+	allowedToolNames: readonly string[]
+): ExtensionFactory {
+	return (pi: ExtensionAPI): void => {
+		const allowed = new Set(allowedToolNames);
+		const allowedLabel = allowedToolNames.join(", ");
+
+		/**
+		 * Keep the active tool set aligned with the explicit allowlist.
+		 *
+		 * @returns void
+		 */
+		const enforceActiveToolSet = (): void => {
+			const filtered = pi.getActiveTools().filter((name) => allowed.has(name));
+			pi.setActiveTools(filtered);
+		};
+
+		pi.on("session_start", async () => {
+			enforceActiveToolSet();
+		});
+
+		pi.on("turn_start", async () => {
+			enforceActiveToolSet();
+		});
+
+		pi.on("tool_call", async (event) => {
+			if (allowed.has(event.toolName)) {
+				return;
+			}
+
+			const reason =
+				allowedToolNames.length === 0
+					? "This session was started with an empty tool allowlist. No tools are available."
+					: `Tool "${event.toolName}" is not available in this session. Allowed tools: ${allowedLabel}`;
+			return {
+				block: true,
+				reason,
+			};
+		});
+	};
+}
+
+/**
  * Resolve the effective tool-result retention policy from layered settings.
  *
  * Precedence: global settings < project settings < runtime overrides.
@@ -319,6 +512,164 @@ export function resolveToolResultRetentionPolicy(params: {
 			DEFAULT_TOOL_RESULT_RETENTION_POLICY.previewChars,
 			10_000
 		),
+	};
+}
+
+/**
+ * Resolve the effective context-budget policy from layered settings.
+ *
+ * Precedence: global settings < project settings < runtime overrides.
+ * Any unset field falls back to the compiled default.
+ *
+ * @param params - Layered settings inputs
+ * @returns Resolved context-budget policy with validated numeric bounds
+ */
+export function resolveContextBudgetPolicy(params: {
+	globalSettings?: Record<string, unknown>;
+	projectSettings?: Record<string, unknown>;
+	runtimeSettings?: Record<string, unknown>;
+}): ContextBudgetPolicy {
+	const globalConfig = readContextBudgetConfig(params.globalSettings);
+	const projectConfig = readContextBudgetConfig(params.projectSettings);
+	const runtimeConfig = readContextBudgetConfig(params.runtimeSettings);
+
+	const merged = {
+		...globalConfig,
+		...projectConfig,
+		...runtimeConfig,
+	};
+
+	return {
+		softThresholdPercent: toNonNegativeInt(
+			merged.softThresholdPercent,
+			DEFAULT_CONTEXT_BUDGET_POLICY.softThresholdPercent,
+			100
+		),
+		hardThresholdPercent: toNonNegativeInt(
+			merged.hardThresholdPercent,
+			DEFAULT_CONTEXT_BUDGET_POLICY.hardThresholdPercent,
+			100
+		),
+		minPerToolBytes: toNonNegativeInt(
+			merged.minPerToolBytes,
+			DEFAULT_CONTEXT_BUDGET_POLICY.minPerToolBytes,
+			10 * 1024 * 1024
+		),
+		maxPerToolBytes: toNonNegativeInt(
+			merged.maxPerToolBytes,
+			DEFAULT_CONTEXT_BUDGET_POLICY.maxPerToolBytes,
+			10 * 1024 * 1024
+		),
+		perTurnReserveTokens: toNonNegativeInt(
+			merged.perTurnReserveTokens,
+			DEFAULT_CONTEXT_BUDGET_POLICY.perTurnReserveTokens,
+			200_000
+		),
+		unknownUsageFallbackCapBytes: toNonNegativeInt(
+			merged.unknownUsageFallbackCapBytes,
+			DEFAULT_CONTEXT_BUDGET_POLICY.unknownUsageFallbackCapBytes,
+			10 * 1024 * 1024
+		),
+	};
+}
+
+/**
+ * Estimate remaining tokens available for tool output.
+ *
+ * When usage.tokens is null (e.g. right after compaction), returns 0
+ * to signal that callers should use the unknown-usage fallback path.
+ *
+ * @param usage - Context usage snapshot from the framework
+ * @param reserveTokens - Tokens to hold back for the model response
+ * @returns Non-negative remaining token count, or 0 when unknown
+ */
+export function estimateRemainingTokens(
+	usage: ContextUsageSnapshot,
+	reserveTokens: number
+): number {
+	if (usage.tokens === null) return 0;
+	return Math.max(0, usage.contextWindow - usage.tokens - reserveTokens);
+}
+
+/**
+ * Convert a token count to an approximate byte budget.
+ *
+ * Uses a conservative 4-bytes-per-token heuristic suitable for English
+ * text and JSON payloads. Non-Latin scripts use more bytes per token;
+ * callers should treat this as an upper-bound estimate.
+ *
+ * @param tokens - Token count to convert
+ * @returns Approximate byte budget
+ */
+export function tokensToBytes(tokens: number): number {
+	return Math.max(0, Math.floor(tokens * 4));
+}
+
+/**
+ * Build a compact one-line budget status string for system prompt injection.
+ *
+ * Format when known: `Context budget: 67% used, ~66k tokens remaining`
+ * Format when unknown: `Context budget: unknown (waiting for fresh usage sample)`
+ *
+ * @param usage - Context usage snapshot
+ * @param policy - Resolved context-budget policy
+ * @returns Deterministic single-line status string
+ */
+export function formatBudgetStatusLine(
+	usage: ContextUsageSnapshot,
+	policy: ContextBudgetPolicy
+): string {
+	if (usage.tokens === null || usage.contextWindow <= 0) {
+		return "Context budget: unknown (waiting for fresh usage sample)";
+	}
+
+	const pct =
+		usage.percent !== null ? usage.percent : Math.round((usage.tokens / usage.contextWindow) * 100);
+	const remaining = estimateRemainingTokens(usage, policy.perTurnReserveTokens);
+	const remainingK = Math.max(0, Math.round(remaining / 1000));
+	return `Context budget: ${pct}% used, ~${remainingK}k tokens remaining`;
+}
+
+/**
+ * Return the fallback byte cap used when context usage is unknown.
+ *
+ * This applies after compaction or before the first LLM response when
+ * the framework reports tokens as null.
+ *
+ * @param policy - Resolved context-budget policy
+ * @returns Byte cap for unknown-usage scenarios
+ */
+export function unknownUsageFallbackBudget(policy: ContextBudgetPolicy): number {
+	return policy.unknownUsageFallbackCapBytes;
+}
+
+/**
+ * Normalize framework context-usage output into a stable snapshot.
+ *
+ * Missing or partial usage values are treated as unknown, which triggers
+ * conservative fallback behavior in budget planning/guarding.
+ *
+ * @param usage - Raw usage object returned by `ctx.getContextUsage()`
+ * @returns Normalized snapshot
+ */
+function normalizeContextUsageSnapshot(usage: unknown): ContextUsageSnapshot {
+	if (!isObjectRecord(usage)) {
+		return { contextWindow: 0, percent: null, tokens: null };
+	}
+
+	const contextWindow =
+		typeof usage.contextWindow === "number" && Number.isFinite(usage.contextWindow)
+			? usage.contextWindow
+			: 0;
+	const tokens =
+		typeof usage.tokens === "number" && Number.isFinite(usage.tokens) ? usage.tokens : null;
+	const percent =
+		typeof usage.percent === "number" && Number.isFinite(usage.percent) ? usage.percent : null;
+
+	return {
+		contextWindow,
+		percent,
+		tokens,
 	};
 }
 
@@ -394,6 +745,20 @@ function readToolResultRetentionConfig(
 }
 
 /**
+ * Read context-budget config from an arbitrary settings object.
+ *
+ * @param settings - Settings record that may include `contextBudget`
+ * @returns Partial context-budget config when present
+ */
+function readContextBudgetConfig(
+	settings: Record<string, unknown> | undefined
+): ContextBudgetConfigInput {
+	if (!settings) return {};
+	const config = settings.contextBudget;
+	return isObjectRecord(config) ? (config as ContextBudgetConfigInput) : {};
+}
+
+/**
  * Clamp a numeric setting to a safe non-negative integer range.
  *
  * @param value - Unknown value from settings
@@ -414,6 +779,79 @@ function toNonNegativeInt(value: unknown, fallback: number, max: number): number
  */
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// ─── Shared Skills Resolution ────────────────────────────────────────────────
+
+/**
+ * Resolve shared skill directory paths from global settings.
+ *
+ * Reads `sharedSkillsDirs` from global settings (project settings are
+ * intentionally ignored — shared skills are a user-level concept).
+ * Each entry is tilde-expanded and validated:
+ *
+ * - Must be an absolute path (after `~` expansion)
+ * - Must exist on disk
+ * - Must be a directory
+ *
+ * Invalid entries emit a warning to stderr and are silently skipped.
+ *
+ * @param globalSettings - Global settings record (may include `sharedSkillsDirs`)
+ * @returns Array of validated, resolved directory paths
+ */
+export function resolveSharedSkillsDirs(
+	globalSettings: Record<string, unknown> | undefined
+): string[] {
+	if (!globalSettings) return [];
+	const raw = globalSettings.sharedSkillsDirs;
+	if (!Array.isArray(raw)) return [];
+
+	const home = homedir();
+	const resolved: string[] = [];
+
+	for (const entry of raw) {
+		if (typeof entry !== "string" || !entry.trim()) {
+			console.error("\x1b[33m⚠ sharedSkillsDirs: entries must be non-empty strings\x1b[0m");
+			continue;
+		}
+
+		const trimmed = entry.trim();
+		let expanded: string;
+		if (trimmed === "~") {
+			expanded = home;
+		} else if (trimmed.startsWith("~/")) {
+			expanded = join(home, trimmed.slice(2));
+		} else if (trimmed.startsWith("/")) {
+			expanded = trimmed;
+		} else {
+			console.error(
+				`\x1b[33m⚠ sharedSkillsDirs: "${trimmed}" must be an absolute path or start with ~/\x1b[0m`
+			);
+			continue;
+		}
+
+		if (!existsSync(expanded)) {
+			// Silently skip non-existent directories — the user may not have
+			// created the shared skills dir yet, and that's fine.
+			continue;
+		}
+
+		try {
+			const stats = statSync(expanded);
+			if (!stats.isDirectory()) {
+				console.error(
+					`\x1b[33m⚠ sharedSkillsDirs: "${expanded}" exists but is not a directory\x1b[0m`
+				);
+				continue;
+			}
+		} catch {
+			continue;
+		}
+
+		resolved.push(expanded);
+	}
+
+	return resolved;
 }
 
 /**
@@ -619,6 +1057,9 @@ export interface TallowSession {
 
 	/** Session ID (UUID or user-provided) for programmatic chaining */
 	sessionId: string;
+
+	/** Session-scoped telemetry handle for OTEL span creation. */
+	telemetry: TelemetryHandle;
 }
 
 /** Catalog entry for a bundled extension shipped with tallow. */
@@ -1081,26 +1522,40 @@ export async function createTallowSession(
 	if (startupProfile === "interactive") {
 		await applyInteractiveModeStaleUiPatch();
 	}
+	await applyAgentSessionCompactionCancelPatch();
+	await applyStreamingYieldPatch();
 
 	// Resolve any op:// secrets not loaded from cache during bootstrap.
 	// Runs in parallel (~2.4s for all) instead of sequential (~2.4s each).
 	await resolveOpSecrets();
 
 	const cwd = options.cwd ?? process.cwd();
+	const tallowHome = getRuntimeTallowHome();
 	const projectTrust = resolveProjectTrust(cwd);
 	applyProjectTrustContextToEnv(projectTrust);
 	const eventBus = createEventBus();
 
+	// ── Telemetry ────────────────────────────────────────────────────────────
+	// Create session-scoped telemetry handle. When config is absent this is a
+	// zero-cost no-op. Incoming trace context from env enables CLI continuation.
+
+	const incomingTraceContext = options.telemetry ? extractTraceContextFromEnv() : null;
+	const telemetry = await createTelemetryHandle(
+		options.telemetry,
+		TALLOW_VERSION,
+		incomingTraceContext
+	);
+
 	// ── Auth & Models ────────────────────────────────────────────────────────
 
-	const authPath = join(TALLOW_HOME, "auth.json");
+	const authPath = join(tallowHome, "auth.json");
 	const { authStorage, migration } = createSecureAuthStorage(authPath);
 	if (migration.migratedProviders.length > 0) {
 		console.error(
 			`\x1b[33m🔐 Migrated ${migration.migratedProviders.length} auth credential(s) to secure references: ${migration.migratedProviders.join(", ")}\x1b[0m`
 		);
 	}
-	const modelRegistry = new ModelRegistry(authStorage, join(TALLOW_HOME, "models.json"));
+	const modelRegistry = new ModelRegistry(authStorage, join(tallowHome, "models.json"));
 
 	// ── Runtime API key (not persisted) ──────────────────────────────────────
 	// Accepts programmatic SDK `apiKey` option or env overrides:
@@ -1121,7 +1576,7 @@ export async function createTallowSession(
 
 	// ── Settings ─────────────────────────────────────────────────────────────
 
-	const settingsManager = SettingsManager.create(cwd, TALLOW_HOME);
+	const settingsManager = SettingsManager.create(cwd, tallowHome);
 	if (options.settings) {
 		settingsManager.applyOverrides(options.settings);
 	}
@@ -1141,10 +1596,23 @@ export async function createTallowSession(
 		runtimeSettings: options.settings,
 	});
 
+	const contextBudgetPolicy = resolveContextBudgetPolicy({
+		globalSettings: settingsManager.getGlobalSettings() as Record<string, unknown>,
+		projectSettings: settingsManager.getProjectSettings() as Record<string, unknown>,
+		runtimeSettings: options.settings,
+	});
+
+	// ── Shared Skills ────────────────────────────────────────────────────────
+	// Global-only setting: project settings cannot inject shared skill dirs.
+
+	const sharedSkillsDirs = resolveSharedSkillsDirs(
+		settingsManager.getGlobalSettings() as Record<string, unknown>
+	);
+
 	// ── Resource Loader ──────────────────────────────────────────────────────
 
 	const additionalExtensionPaths: string[] = [];
-	const additionalSkillPaths: string[] = [];
+	const additionalSkillPaths: string[] = [...sharedSkillsDirs];
 	const additionalPromptPaths: string[] = [];
 	const additionalThemePaths: string[] = [];
 	const extensionsOnly = options.extensionsOnly === true;
@@ -1155,7 +1623,7 @@ export async function createTallowSession(
 	// Bundled resources from the package
 	if (!extensionsOnly && !options.noBundledExtensions && existsSync(BUNDLED.extensions)) {
 		// Discover user extensions that might override bundled ones
-		const userExtDir = join(TALLOW_HOME, "extensions");
+		const userExtDir = join(tallowHome, "extensions");
 		const userExtNames = new Set<string>();
 		const userExtPaths = new Map<string, string>();
 		if (existsSync(userExtDir)) {
@@ -1201,7 +1669,7 @@ export async function createTallowSession(
 
 	const resolvedPlugins: ResolvedPlugin[] = [];
 	if (!extensionsOnly) {
-		const pluginSpecs = collectPluginSpecs(cwd, options.plugins, projectTrust.status);
+		const pluginSpecs = collectPluginSpecs(cwd, options.plugins, projectTrust.status, tallowHome);
 		const pluginResult = resolvePlugins(pluginSpecs);
 
 		// Report plugin errors (non-fatal — one bad plugin doesn't block startup)
@@ -1246,8 +1714,8 @@ export async function createTallowSession(
 
 		// Expose plugin commands/agents dirs as env vars for the command-prompt
 		// and agent-commands-tool extensions to discover at runtime.
-		appendPathListEnv("TALLOW_PLUGIN_COMMANDS_DIRS", pluginCommandsDirs);
-		appendPathListEnv("TALLOW_PLUGIN_AGENTS_DIRS", pluginAgentsDirs);
+		setPathListEnv("TALLOW_PLUGIN_COMMANDS_DIRS", pluginCommandsDirs);
+		setPathListEnv("TALLOW_PLUGIN_AGENTS_DIRS", pluginAgentsDirs);
 	}
 
 	// ── Package AGENTS.md loading ────────────────────────────────────────────
@@ -1260,17 +1728,20 @@ export async function createTallowSession(
 
 	if (projectTrust.status !== "trusted") {
 		console.error(
-			"\x1b[33m⚠ Project is untrusted — repo-controlled execution surfaces are blocked until /trust-project\x1b[0m"
+			projectTrust.status === "stale_fingerprint"
+				? "\x1b[33m⚠ Project trust is stale — repo-controlled execution surfaces are blocked until /trust-project\x1b[0m"
+				: "\x1b[33m⚠ Project is untrusted — repo-controlled execution surfaces are blocked until /trust-project\x1b[0m"
 		);
 	}
 
 	const dedupedExtensionPaths = [...new Set(additionalExtensionPaths)];
 	const shouldApplyExtensionStartupPolicies =
 		shouldBlockProjectExtensions || startupProfile === "headless";
+	const explicitToolRestrictionNames = resolveExplicitToolRestrictionNames(options);
 
 	const loader = new DefaultResourceLoader({
 		cwd,
-		agentDir: TALLOW_HOME,
+		agentDir: tallowHome,
 		settingsManager,
 		eventBus,
 		additionalExtensionPaths: dedupedExtensionPaths,
@@ -1278,11 +1749,16 @@ export async function createTallowSession(
 		additionalPromptTemplatePaths: additionalPromptPaths,
 		additionalThemePaths,
 		extensionFactories: [
-			rebrandSystemPrompt,
+			createRebrandSystemPromptExtension(contextBudgetPolicy),
 			injectImageFilePaths,
-			createToolResultRetentionExtension(toolResultRetentionPolicy),
+			createToolResultRetentionExtension(toolResultRetentionPolicy, contextBudgetPolicy),
+			createContextBudgetPlannerExtension(contextBudgetPolicy),
 			detectOutputTruncation,
 			createProjectTrustExtension(cwd, projectTrust),
+			createTelemetryExtension(telemetry, cwd),
+			...(explicitToolRestrictionNames
+				? [createExplicitToolRestrictionExtension(explicitToolRestrictionNames)]
+				: []),
 			...(options.extensionFactories ?? []),
 		],
 		noExtensions: extensionsOnly,
@@ -1395,7 +1871,7 @@ export async function createTallowSession(
 
 	const result = await createAgentSession({
 		cwd,
-		agentDir: TALLOW_HOME,
+		agentDir: tallowHome,
 		model: resolvedModel,
 		thinkingLevel: options.thinkingLevel,
 		authStorage,
@@ -1406,6 +1882,13 @@ export async function createTallowSession(
 		tools: options.tools,
 		customTools: options.customTools,
 	});
+
+	if (explicitToolRestrictionNames) {
+		const sessionWithToolControl = result.session as typeof result.session & {
+			setActiveToolsByName?: (toolNames: readonly string[]) => void;
+		};
+		sessionWithToolControl.setActiveToolsByName?.(explicitToolRestrictionNames);
+	}
 
 	startupTiming.mark("create-session", createSessionStartedAtMs);
 	instrumentSessionStartupTimings(result.session, startupTiming);
@@ -1418,6 +1901,7 @@ export async function createTallowSession(
 		extensionOverrides,
 		resolvedPlugins,
 		sessionId: sessionManager.getSessionId(),
+		telemetry,
 	};
 }
 
@@ -1437,14 +1921,14 @@ export async function createTallowSession(
  * @param cwd - Current working directory (for project settings)
  * @param cliPlugins - Additional plugin specs from CLI --plugin-dir or options.plugins
  * @param trustStatus - Current project trust status
- * @param tallowHome - Optional tallow home override for settings lookup (defaults to TALLOW_HOME)
+ * @param tallowHome - Optional tallow home override for settings lookup (defaults to runtime TALLOW_HOME)
  * @returns Deduplicated array of plugin spec strings
  */
 export function collectPluginSpecs(
 	cwd: string,
 	cliPlugins: string[] | undefined,
 	trustStatus: ProjectTrustStatus,
-	tallowHome = TALLOW_HOME
+	tallowHome = getRuntimeTallowHome()
 ): string[] {
 	const specs = new Set<string>();
 
@@ -1478,22 +1962,27 @@ export function collectPluginSpecs(
 }
 
 /**
- * Append filesystem paths to a path-list env var using platform delimiter.
+ * Replace a path-list env var using platform delimiter.
  *
- * Existing values are preserved, new values are appended, and duplicates
- * are removed while preserving first-seen order.
+ * Each session writes its own exact plugin resource set so stale values from
+ * earlier sessions cannot leak into later ones in the same long-lived process.
  *
  * @param key - Environment variable key
- * @param values - Absolute directory paths to append
+ * @param values - Absolute directory paths to store
+ * @param env - Environment object to mutate (defaults to process.env)
  * @returns Nothing
  */
-function appendPathListEnv(key: string, values: string[]): void {
-	if (values.length === 0) return;
-
-	const existingRaw = process.env[key];
-	const existing = existingRaw ? existingRaw.split(delimiter).filter((v) => v.length > 0) : [];
-	const merged = [...new Set([...existing, ...values])];
-	process.env[key] = merged.join(delimiter);
+export function setPathListEnv(
+	key: string,
+	values: readonly string[],
+	env: NodeJS.ProcessEnv = process.env
+): void {
+	const deduped = [...new Set(values.filter((value) => value.length > 0))];
+	if (deduped.length === 0) {
+		delete env[key];
+		return;
+	}
+	env[key] = deduped.join(delimiter);
 }
 
 /** Context file loaded from a package directory. */
@@ -1526,7 +2015,7 @@ function loadAgentsFilesFromPackages(settingsManager: SettingsManager, cwd: stri
 	// Use a PackageManager to resolve installed paths for all source types
 	const pkgManager = new DefaultPackageManager({
 		cwd,
-		agentDir: TALLOW_HOME,
+		agentDir: getRuntimeTallowHome(),
 		settingsManager,
 	});
 
@@ -1590,6 +2079,90 @@ function discoverExtensionDirs(baseDir: string): string[] {
 }
 
 /**
+ * Create a built-in extension that instruments session lifecycle with OTEL spans.
+ *
+ * Publishes the telemetry handle via event bus so other extensions (subagent,
+ * teams) can access it for trace context propagation. Instruments:
+ * - session_start / session_end → session span
+ * - turn_start / turn_end → prompt spans
+ * - tool_call / tool_result → tool spans
+ * - model selection and compaction events
+ *
+ * All instrumentation is zero-cost when telemetry is disabled (no-op handle).
+ *
+ * @param telemetry - Session-scoped telemetry handle
+ * @param cwd - Working directory for session attributes
+ * @returns Extension factory
+ */
+function createTelemetryExtension(telemetry: TelemetryHandle, cwd: string): ExtensionFactory {
+	return (pi: ExtensionAPI): void => {
+		// Track active spans for proper lifecycle management.
+		let sessionSpan: import("@opentelemetry/api").Span | null = null;
+		let promptSpan: import("@opentelemetry/api").Span | null = null;
+		const toolSpans = new Map<string, import("@opentelemetry/api").Span>();
+
+		// Publish the telemetry handle via event bus for extensions.
+		const publishTelemetryApi = (): void => {
+			pi.events.emit(TELEMETRY_API_CHANNELS.api, { handle: telemetry });
+		};
+
+		pi.events.on(TELEMETRY_API_CHANNELS.apiRequest, publishTelemetryApi);
+
+		// ── Session Lifecycle ────────────────────────────────────────────────
+
+		pi.on("session_start", async (_event, ctx) => {
+			publishTelemetryApi();
+
+			const sessionId = ctx.sessionManager.getSessionId();
+			sessionSpan = telemetry.startSpan("tallow.session.create", sessionAttributes(sessionId, cwd));
+		});
+
+		pi.on("agent_end", async () => {
+			if (sessionSpan) {
+				sessionSpan.end();
+				sessionSpan = null;
+			}
+		});
+
+		// ── Prompt / Turn ────────────────────────────────────────────────────
+
+		pi.on("turn_start", async (event) => {
+			promptSpan = telemetry.startSpan("tallow.prompt", {
+				"tallow.prompt.turn_index": event.turnIndex,
+			});
+		});
+
+		pi.on("turn_end", async () => {
+			if (promptSpan) {
+				promptSpan.end();
+				promptSpan = null;
+			}
+		});
+
+		// ── Tool Calls ───────────────────────────────────────────────────────
+
+		pi.on("tool_call", async (event) => {
+			const span = telemetry.startSpan("tallow.tool.call", {
+				"tallow.tool.name": event.toolName,
+				"tallow.tool.call_id": event.toolCallId,
+			});
+			toolSpans.set(event.toolCallId, span);
+		});
+
+		pi.on("tool_result", async (event) => {
+			const span = toolSpans.get(event.toolCallId);
+			if (span) {
+				if (event.isError) {
+					span.setStatus?.({ code: 2, message: "tool_error" });
+				}
+				span.end();
+				toolSpans.delete(event.toolCallId);
+			}
+		});
+	};
+}
+
+/**
  * Register trust commands and startup banner for project trust UX.
  *
  * @param cwd - Session working directory
@@ -1601,13 +2174,56 @@ function createProjectTrustExtension(
 	initialTrust: ProjectTrustContext
 ): ExtensionFactory {
 	return (pi) => {
+		let currentCwd = cwd;
 		let trustContext = initialTrust;
 
-		pi.on("session_start", async (_event, ctx) => {
-			if (!ctx.hasUI) return;
-			if (trustContext.status === "trusted") return;
+		/**
+		 * Re-resolve trust for the active cwd and project it into env.
+		 *
+		 * @param nextCwd - Working directory whose trust state should become active
+		 * @returns Refreshed trust context
+		 */
+		const syncTrustContext = (nextCwd: string): ProjectTrustContext => {
+			currentCwd = nextCwd;
+			trustContext = resolveProjectTrust(currentCwd);
+			applyProjectTrustContextToEnv(trustContext);
+			return trustContext;
+		};
 
-			const banner = buildProjectTrustBannerPayload(trustContext);
+		const trustApi = {
+			inspect(targetCwd: string): ProjectTrustContext {
+				return resolveProjectTrust(targetCwd);
+			},
+			trust(targetCwd: string): ProjectTrustContext {
+				const nextTrust = trustProject(targetCwd);
+				if (nextTrust.canonicalCwd === trustContext.canonicalCwd) {
+					applyProjectTrustContextToEnv(nextTrust);
+					trustContext = nextTrust;
+				}
+				return nextTrust;
+			},
+		};
+
+		const publishTrustApi = (): void => {
+			pi.events.emit(PROJECT_TRUST_API_CHANNELS.api, { api: trustApi });
+		};
+
+		pi.events.on(PROJECT_TRUST_API_CHANNELS.apiRequest, publishTrustApi);
+		publishTrustApi();
+
+		pi.events.on("tallow:cwd_changed", (payload: unknown) => {
+			if (!payload || typeof payload !== "object") return;
+			const nextCwd = (payload as { cwd?: unknown }).cwd;
+			if (typeof nextCwd !== "string" || nextCwd.length === 0) return;
+			syncTrustContext(nextCwd);
+		});
+
+		pi.on("session_start", async (_event, ctx) => {
+			const currentTrust = syncTrustContext(currentCwd);
+			if (!ctx.hasUI) return;
+			if (currentTrust.status === "trusted") return;
+
+			const banner = buildProjectTrustBannerPayload(currentTrust);
 			ctx.ui.notify(banner.content, "warning");
 			pi.sendMessage(
 				{
@@ -1623,41 +2239,46 @@ function createProjectTrustExtension(
 		pi.registerCommand("trust-project", {
 			description: "Trust this project and enable repo-controlled execution surfaces",
 			handler: async (_args, ctx) => {
-				trustContext = trustProject(cwd);
+				currentCwd = process.cwd();
+				trustContext = trustProject(currentCwd);
 				applyProjectTrustContextToEnv(trustContext);
-				ctx.ui.notify(
-					`Trusted project: ${trustContext.canonicalCwd}\n` +
-						"Restart this session to apply blocked project surfaces.",
-					"info"
-				);
+				ctx.ui.setWorkingMessage("Reloading workspace after trust change...");
+				try {
+					await ctx.reload();
+				} finally {
+					ctx.ui.setWorkingMessage();
+				}
+				ctx.ui.notify(`Trusted project: ${trustContext.canonicalCwd}`, "info");
 			},
 		});
 
 		pi.registerCommand("untrust-project", {
 			description: "Remove trust for this project and block repo-controlled execution surfaces",
 			handler: async (_args, ctx) => {
-				trustContext = untrustProject(cwd);
+				currentCwd = process.cwd();
+				trustContext = untrustProject(currentCwd);
 				applyProjectTrustContextToEnv(trustContext);
-				ctx.ui.notify(
-					`Removed trust for project: ${trustContext.canonicalCwd}\n` +
-						"Restart this session to enforce trust-gated blocking.",
-					"warning"
-				);
+				ctx.ui.setWorkingMessage("Reloading workspace after trust change...");
+				try {
+					await ctx.reload();
+				} finally {
+					ctx.ui.setWorkingMessage();
+				}
+				ctx.ui.notify(`Removed trust for project: ${trustContext.canonicalCwd}`, "warning");
 			},
 		});
 
 		pi.registerCommand("trust-status", {
 			description: "Show trust status and fingerprint details for this project",
 			handler: async (_args, ctx) => {
-				trustContext = resolveProjectTrust(cwd);
-				applyProjectTrustContextToEnv(trustContext);
+				const currentTrust = syncTrustContext(process.cwd());
 				const lines = [
-					`status: ${trustContext.status}`,
-					`project: ${trustContext.canonicalCwd}`,
-					`current fingerprint: ${trustContext.fingerprint}`,
-					`stored fingerprint: ${trustContext.storedFingerprint ?? "(none)"}`,
+					`status: ${currentTrust.status}`,
+					`project: ${currentTrust.canonicalCwd}`,
+					`current fingerprint: ${currentTrust.fingerprint}`,
+					`stored fingerprint: ${currentTrust.storedFingerprint ?? "(none)"}`,
 				];
-				if (trustContext.status !== "trusted") {
+				if (currentTrust.status !== "trusted") {
 					lines.push("repo-controlled project surfaces are currently blocked");
 				}
 				ctx.ui.notify(lines.join("\n"), "info");
@@ -1667,44 +2288,56 @@ function createProjectTrustExtension(
 }
 
 /**
- * Built-in extension factory that rebrands the pi system prompt for tallow.
+ * Create a built-in extension factory that rebrands the pi system prompt for tallow
+ * and appends a compact context-budget status line each turn.
+ *
  * Registered as a factory so it cannot be overridden or removed by users.
+ *
+ * @param budgetPolicy - Resolved context-budget policy for status line generation
+ * @returns Extension factory
  */
-function rebrandSystemPrompt(pi: ExtensionAPI): void {
-	pi.on("before_agent_start", async (event, ctx) => {
-		let prompt = event.systemPrompt
-			.replace(
-				"You are an expert coding assistant operating inside pi, a coding agent harness.",
-				"You are an expert coding assistant operating inside tallow, a coding agent harness."
-			)
-			.replace(/Pi documentation/g, "Tallow documentation")
-			.replace(/When working on pi topics/g, "When working on tallow topics")
-			.replace(/read pi \.md files/g, "read tallow .md files")
-			.replace(/the user asks about pi itself/g, "the user asks about tallow itself");
+function createRebrandSystemPromptExtension(budgetPolicy: ContextBudgetPolicy): ExtensionFactory {
+	return (pi: ExtensionAPI): void => {
+		pi.on("before_agent_start", async (event, ctx) => {
+			let prompt = event.systemPrompt
+				.replace(
+					"You are an expert coding assistant operating inside pi, a coding agent harness.",
+					"You are an expert coding assistant operating inside tallow, a coding agent harness."
+				)
+				.replace(/Pi documentation/g, "Tallow documentation")
+				.replace(/When working on pi topics/g, "When working on tallow topics")
+				.replace(/read pi \.md files/g, "read tallow .md files")
+				.replace(/the user asks about pi itself/g, "the user asks about tallow itself");
 
-		// Core guidelines baked into every tallow session
-		prompt +=
-			"\n\nLLM intelligence is not always the answer. When a well-designed algorithm, heuristic, or deterministic approach can solve the problem reliably, prefer that over reaching for another LLM call. Reserve model inference for tasks that genuinely require reasoning, creativity, or natural-language understanding.";
+			// Core guidelines baked into every tallow session
+			prompt +=
+				"\n\nLLM intelligence is not always the answer. When a well-designed algorithm, heuristic, or deterministic approach can solve the problem reliably, prefer that over reaching for another LLM call. Reserve model inference for tasks that genuinely require reasoning, creativity, or natural-language understanding.";
 
-		// Communicate strategy changes proactively
-		prompt +=
-			"\n\nIf you hit an internal limit (thinking budget, output length, or planning complexity) that forces you to change approach — say so immediately. Never silently pivot from planning to execution, or drop planned items, without telling the user what happened and why.";
+			// Communicate strategy changes proactively
+			prompt +=
+				"\n\nIf you hit an internal limit (thinking budget, output length, or planning complexity) that forces you to change approach — say so immediately. Never silently pivot from planning to execution, or drop planned items, without telling the user what happened and why.";
 
-		// Detect unexpected workspace changes
-		prompt +=
-			"\n\nWhile you are working, if you notice unexpected changes in the workspace that you didn't make — STOP IMMEDIATELY and tell the user what you found. Do not attempt to revert, overwrite, or work around them. Ask the user how they would like to proceed.";
+			// Detect unexpected workspace changes
+			prompt +=
+				"\n\nWhile you are working, if you notice unexpected changes in the workspace that you didn't make — STOP IMMEDIATELY and tell the user what you found. Do not attempt to revert, overwrite, or work around them. Ask the user how they would like to proceed.";
 
-		// Review mindset
-		prompt +=
-			"\n\nWhen the user asks for a review, default to a code-review mindset. Prioritize identifying bugs, risks, behavioral regressions, and missing tests. Present findings first, ordered by severity, with file and line references where possible. State explicitly if no issues were found and call out any residual risks or test gaps.";
+			// Review mindset
+			prompt +=
+				"\n\nWhen the user asks for a review, default to a code-review mindset. Prioritize identifying bugs, risks, behavioral regressions, and missing tests. Present findings first, ordered by severity, with file and line references where possible. State explicitly if no issues were found and call out any residual risks or test gaps.";
 
-		// Inject model identity so non-Claude models don't confabulate their identity
-		if (ctx.model) {
-			prompt += `\n\nYou are running as ${ctx.model.name} (${ctx.model.provider}/${ctx.model.id}).`;
-		}
+			// Inject model identity so non-Claude models don't confabulate their identity
+			if (ctx.model) {
+				prompt += `\n\nYou are running as ${ctx.model.name} (${ctx.model.provider}/${ctx.model.id}).`;
+			}
 
-		return { systemPrompt: prompt };
-	});
+			// Append compact budget status line for context awareness
+			const usage = normalizeContextUsageSnapshot(ctx.getContextUsage?.());
+			const budgetLine = formatBudgetStatusLine(usage, budgetPolicy);
+			prompt += `\n\n[${budgetLine}]`;
+
+			return { systemPrompt: prompt };
+		});
+	};
 }
 
 /**
@@ -1739,9 +2372,78 @@ function injectImageFilePaths(pi: ExtensionAPI): void {
  * @param policy - Resolved retention policy
  * @returns Extension factory
  */
-function createToolResultRetentionExtension(policy: ToolResultRetentionPolicy): ExtensionFactory {
+function createToolResultRetentionExtension(
+	policy: ToolResultRetentionPolicy,
+	budgetPolicy: ContextBudgetPolicy
+): ExtensionFactory {
 	return (pi: ExtensionAPI): void => {
-		if (!policy.enabled) return;
+		// ── Ingestion-time guard on tool_result ──────────────────────────────
+		// Truncate oversized textual payloads before persistence when context
+		// budget is tight or usage is unknown. Compatibility invariants:
+		// - Never change toolCallId, toolName, or isError
+		// - Preserve existing details fields
+		// - Add guard metadata only under namespaced key
+		// - Leave non-text blocks structurally unchanged
+		pi.on("tool_result", async (event, ctx) => {
+			const usage = normalizeContextUsageSnapshot(ctx.getContextUsage?.());
+			const usageUnknown = usage.tokens === null || usage.contextWindow <= 0;
+			const usagePercent =
+				usage.percent !== null
+					? usage.percent
+					: usage.tokens === null || usage.contextWindow <= 0
+						? null
+						: Math.round((usage.tokens / usage.contextWindow) * 100);
+
+			const safeBudgetBytes = (() => {
+				if (usageUnknown) {
+					return unknownUsageFallbackBudget(budgetPolicy);
+				}
+
+				const remainingTokens = estimateRemainingTokens(usage, budgetPolicy.perTurnReserveTokens);
+				const baseline = Math.min(
+					budgetPolicy.maxPerToolBytes,
+					Math.max(budgetPolicy.minPerToolBytes, tokensToBytes(remainingTokens))
+				);
+
+				if (usagePercent !== null && usagePercent >= budgetPolicy.hardThresholdPercent) {
+					return budgetPolicy.minPerToolBytes;
+				}
+
+				if (usagePercent !== null && usagePercent >= budgetPolicy.softThresholdPercent) {
+					return Math.max(budgetPolicy.minPerToolBytes, Math.floor(baseline * 0.5));
+				}
+
+				return baseline;
+			})();
+
+			const guarded = guardToolResultContent(
+				event.content as Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+				safeBudgetBytes
+			);
+			if (!guarded.wasGuarded) {
+				return;
+			}
+
+			const guardMeta: BudgetGuardMetadata = {
+				guardedAt: new Date().toISOString(),
+				originalContentBytes: guarded.originalTextBytes,
+				truncatedToBytes: guarded.truncatedToBytes,
+				reason: usageUnknown ? "unknown_usage" : "over_budget",
+			};
+
+			const existingDetails = isObjectRecord(event.details) ? event.details : {};
+			return {
+				content: guarded.content as Array<
+					{ type: "image"; data: string; mimeType: string } | { type: "text"; text: string }
+				>,
+				details: { ...existingDetails, [TOOL_RESULT_BUDGET_GUARD_MARKER]: guardMeta },
+			};
+		});
+
+		// ── Historical turn_end retention (unchanged) ────────────────────────
+		if (!policy.enabled) {
+			return;
+		}
 
 		pi.on("turn_end", async (_event, ctx) => {
 			const messages: Array<Record<string, unknown>> = [];
@@ -1753,6 +2455,310 @@ function createToolResultRetentionExtension(policy: ToolResultRetentionPolicy): 
 			if (messages.length === 0) return;
 
 			applyToolResultRetentionToMessages(messages, policy);
+		});
+	};
+}
+
+/**
+ * Apply ingestion-time guardrails to a tool-result content array.
+ *
+ * Only textual blocks are truncated. Non-text blocks are preserved in place
+ * to avoid breaking renderer contracts.
+ *
+ * @param content - Tool-result content blocks
+ * @param maxTextBytes - Maximum allowed bytes across all text blocks
+ * @returns Guarded content payload metadata
+ */
+function guardToolResultContent(
+	content: Array<{ type: string; text?: string; data?: string; mimeType?: string }>,
+	maxTextBytes: number
+): GuardedToolResultContent {
+	let originalTextBytes = 0;
+	let totalContentBytes = 0;
+	for (const block of content) {
+		if (block.type === "text") {
+			const text = block.text ?? "";
+			const textBytes = Buffer.byteLength(text, "utf-8");
+			originalTextBytes += textBytes;
+			totalContentBytes += textBytes;
+			continue;
+		}
+
+		totalContentBytes += Buffer.byteLength(JSON.stringify(block), "utf-8");
+	}
+
+	if (originalTextBytes > 0 && originalTextBytes <= maxTextBytes) {
+		return {
+			content,
+			originalTextBytes,
+			truncatedToBytes: originalTextBytes,
+			wasGuarded: false,
+		};
+	}
+
+	if (originalTextBytes === 0) {
+		if (totalContentBytes <= maxTextBytes) {
+			return {
+				content,
+				originalTextBytes,
+				truncatedToBytes: 0,
+				wasGuarded: false,
+			};
+		}
+
+		const fallbackText =
+			"[non-text tool output exceeds context budget; payload preserved without structural rewrite]";
+		return {
+			content: [{ type: "text", text: fallbackText }, ...content],
+			originalTextBytes,
+			truncatedToBytes: 0,
+			wasGuarded: true,
+		};
+	}
+
+	const nextContent: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+	let bytesUsed = 0;
+	let truncated = false;
+
+	for (const block of content) {
+		if (block.type !== "text") {
+			nextContent.push(block);
+			continue;
+		}
+
+		if (truncated) {
+			continue;
+		}
+
+		const text = block.text ?? "";
+		const blockBytes = Buffer.byteLength(text, "utf-8");
+		if (bytesUsed + blockBytes <= maxTextBytes) {
+			nextContent.push({ ...block, text });
+			bytesUsed += blockBytes;
+			continue;
+		}
+
+		const remaining = Math.max(0, maxTextBytes - bytesUsed);
+		const truncatedText =
+			remaining > 0
+				? truncateTextToBytes(text, remaining)
+				: "[output truncated by context-budget guard]";
+		const marker =
+			remaining > 0
+				? `\n\n[output truncated by context-budget guard — ${formatBytesForSummary(originalTextBytes)} → ${formatBytesForSummary(maxTextBytes)}]`
+				: `\n\n[output truncated by context-budget guard — ${formatBytesForSummary(originalTextBytes)} original]`;
+		nextContent.push({ type: "text", text: `${truncatedText}${marker}` });
+		bytesUsed = maxTextBytes;
+		truncated = true;
+	}
+
+	if (!truncated) {
+		return {
+			content,
+			originalTextBytes,
+			truncatedToBytes: originalTextBytes,
+			wasGuarded: false,
+		};
+	}
+
+	return {
+		content: nextContent,
+		originalTextBytes,
+		truncatedToBytes: Math.min(originalTextBytes, maxTextBytes),
+		wasGuarded: true,
+	};
+}
+
+/**
+ * Truncate a string to fit within a byte budget (UTF-8 safe).
+ *
+ * Walks backward from an estimated character position to find a safe
+ * cut point that does not split a multi-byte character.
+ *
+ * @param text - Source text to truncate
+ * @param maxBytes - Maximum UTF-8 byte length
+ * @returns Truncated string guaranteed to be at most maxBytes
+ */
+function truncateTextToBytes(text: string, maxBytes: number): string {
+	if (Buffer.byteLength(text, "utf-8") <= maxBytes) return text;
+	// Start from an optimistic char position (ASCII-equivalent)
+	let end = Math.min(text.length, maxBytes);
+	while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf-8") > maxBytes) {
+		end -= 1;
+	}
+	return text.slice(0, end);
+}
+
+/**
+ * Create a batch planner extension that computes per-tool byte envelopes
+ * from assistant tool calls and publishes them via the event bus.
+ *
+ * On `message_end` for assistant messages, inspects tool calls in the
+ * message content and allocates a budget envelope for each one, keyed
+ * by toolCallId. Envelopes are single-use (consumed via the API) and
+ * automatically cleaned up on turn_end, agent_end, session_before_switch,
+ * and session_switch events.
+ *
+ * @param budgetPolicy - Resolved context-budget policy
+ * @returns Extension factory
+ */
+function createContextBudgetPlannerExtension(budgetPolicy: ContextBudgetPolicy): ExtensionFactory {
+	return (pi: ExtensionAPI): void => {
+		const envelopeStore = new Map<
+			string,
+			{
+				envelope: { maxBytes: number; batchSize: number };
+				metadata: { createdAtMs: number; turnIndex: number; ttlMs: number };
+			}
+		>();
+		let currentTurnIndex = 0;
+
+		/** Clamp a per-tool envelope to policy min/max bounds. */
+		const clampPerToolBytes = (value: number): number =>
+			Math.min(budgetPolicy.maxPerToolBytes, Math.max(budgetPolicy.minPerToolBytes, value));
+
+		/** Drop stale envelopes so stale calls cannot reuse old budgets. */
+		const pruneStaleEnvelopes = (nowMs: number): void => {
+			for (const [toolCallId, entry] of envelopeStore) {
+				const expired = nowMs - entry.metadata.createdAtMs > entry.metadata.ttlMs;
+				const wrongTurn = entry.metadata.turnIndex !== currentTurnIndex;
+				if (expired || wrongTurn) {
+					envelopeStore.delete(toolCallId);
+				}
+			}
+		};
+
+		/** Clear all envelopes from the planner state. */
+		const clearEnvelopes = (): void => {
+			envelopeStore.clear();
+		};
+
+		/** Resolve per-tool budget for one tool-call batch. */
+		const resolvePerToolBudget = (usage: ContextUsageSnapshot, batchSize: number): number => {
+			if (usage.tokens === null || usage.contextWindow <= 0) {
+				return clampPerToolBytes(unknownUsageFallbackBudget(budgetPolicy));
+			}
+
+			const usagePercent =
+				usage.percent !== null
+					? usage.percent
+					: Math.round((usage.tokens / usage.contextWindow) * 100);
+			const remainingTokens = estimateRemainingTokens(usage, budgetPolicy.perTurnReserveTokens);
+			const totalBytes = tokensToBytes(remainingTokens);
+			const rawPerTool = Math.floor(totalBytes / Math.max(1, batchSize));
+
+			// Apply additional pressure once the turn is near the hard threshold.
+			if (usagePercent >= budgetPolicy.hardThresholdPercent) {
+				return clampPerToolBytes(Math.min(rawPerTool, budgetPolicy.minPerToolBytes));
+			}
+
+			if (usagePercent >= budgetPolicy.softThresholdPercent) {
+				const cautiousPerTool = Math.floor(rawPerTool * 0.5);
+				return clampPerToolBytes(cautiousPerTool);
+			}
+
+			return clampPerToolBytes(rawPerTool);
+		};
+
+		/** Publish the planner API for tool extensions. */
+		const publishBudgetApi = (): void => {
+			pi.events.emit(CONTEXT_BUDGET_API_CHANNELS.budgetApi, { api: budgetApi });
+		};
+
+		// Track turn index and evict stale envelopes at turn boundaries.
+		pi.on("turn_start", async (event) => {
+			currentTurnIndex = event.turnIndex;
+			pruneStaleEnvelopes(Date.now());
+		});
+
+		// Compute envelopes on assistant message_end.
+		pi.on("message_end", async (event, ctx) => {
+			if (!event.message || event.message.role !== "assistant") {
+				return;
+			}
+
+			const content = event.message.content;
+			if (!Array.isArray(content)) {
+				return;
+			}
+
+			const toolCalls = content.filter(
+				(
+					block
+				): block is {
+					arguments: Record<string, unknown>;
+					id: string;
+					name: string;
+					type: "toolCall";
+				} =>
+					isObjectRecord(block) &&
+					block.type === "toolCall" &&
+					typeof block.id === "string" &&
+					typeof block.name === "string" &&
+					isObjectRecord(block.arguments)
+			);
+			if (toolCalls.length === 0) {
+				return;
+			}
+
+			const nowMs = Date.now();
+			pruneStaleEnvelopes(nowMs);
+
+			const usage = normalizeContextUsageSnapshot(ctx.getContextUsage?.());
+			const batchSize = toolCalls.length;
+			const perToolBytes = resolvePerToolBudget(usage, batchSize);
+
+			for (const toolCall of toolCalls) {
+				envelopeStore.set(toolCall.id, {
+					envelope: { batchSize, maxBytes: perToolBytes },
+					metadata: {
+						createdAtMs: nowMs,
+						ttlMs: CONTEXT_BUDGET_ENVELOPE_TTL_MS,
+						turnIndex: currentTurnIndex,
+					},
+				});
+			}
+		});
+
+		const budgetApi = {
+			take(toolCallId: string) {
+				const nowMs = Date.now();
+				pruneStaleEnvelopes(nowMs);
+				const entry = envelopeStore.get(toolCallId);
+				if (!entry) {
+					return undefined;
+				}
+
+				const expired = nowMs - entry.metadata.createdAtMs > entry.metadata.ttlMs;
+				const wrongTurn = entry.metadata.turnIndex !== currentTurnIndex;
+				envelopeStore.delete(toolCallId);
+				if (expired || wrongTurn) {
+					return undefined;
+				}
+
+				return entry.envelope;
+			},
+		};
+
+		pi.on("session_start", async () => {
+			publishBudgetApi();
+		});
+
+		pi.events.on(CONTEXT_BUDGET_API_CHANNELS.budgetApiRequest, () => {
+			publishBudgetApi();
+		});
+
+		pi.on("turn_end", async () => {
+			clearEnvelopes();
+		});
+		pi.on("agent_end", async () => {
+			clearEnvelopes();
+		});
+		pi.on("session_before_switch", async () => {
+			clearEnvelopes();
+		});
+		pi.on("session_switch", async () => {
+			clearEnvelopes();
 		});
 	};
 }
@@ -1787,7 +2793,8 @@ function detectOutputTruncation(pi: ExtensionAPI): void {
  * @returns Nothing
  */
 function ensureTallowHome(startupProfile: TallowStartupProfile): void {
-	const dirs = [TALLOW_HOME, join(TALLOW_HOME, "sessions"), join(TALLOW_HOME, "extensions")];
+	const tallowHome = getRuntimeTallowHome();
+	const dirs = [tallowHome, join(tallowHome, "sessions"), join(tallowHome, "extensions")];
 
 	for (const dir of dirs) {
 		if (!existsSync(dir)) {
@@ -1796,7 +2803,7 @@ function ensureTallowHome(startupProfile: TallowStartupProfile): void {
 	}
 
 	// Migrate flat session files to per-cwd subdirectories (one-time, idempotent)
-	migrateSessionsToPerCwdDirs(join(TALLOW_HOME, "sessions"));
+	migrateSessionsToPerCwdDirs(join(tallowHome, "sessions"));
 
 	// Kill orphaned child processes from crashed/killed previous sessions
 	const orphansKilled = cleanupOrphanPids();
@@ -1837,7 +2844,7 @@ const TALLOW_KEYBINDINGS: Record<string, string | string[]> = {
  * Merges with any existing user customizations — tallow keys take precedence.
  */
 function ensureKeybindings(): void {
-	const keybindingsPath = join(TALLOW_HOME, "keybindings.json");
+	const keybindingsPath = join(getRuntimeTallowHome(), "keybindings.json");
 
 	let existing: Record<string, unknown> = {};
 	if (existsSync(keybindingsPath)) {

@@ -210,6 +210,7 @@ export class TUI extends Container {
 	/** Global callback for debug key (Shift+Ctrl+D). Called before input is forwarded to focused component. */
 	public onDebug?: () => void;
 	private renderRequested = false;
+	private pendingRenderHandle?: ReturnType<typeof setTimeout>;
 	private cursorRow = 0; // Logical cursor row (end of rendered content)
 	private hardwareCursorRow = 0; // Actual terminal cursor row (may differ due to IME positioning)
 	private inputBuffer = ""; // Buffer for parsing terminal responses
@@ -220,6 +221,7 @@ export class TUI extends Container {
 	private previousViewportTop = 0; // Track previous viewport top for resize-aware cursor moves
 	private fullRedrawCount = 0;
 	private stopped = false;
+	private pendingScrollbackClear = false; // Clear scrollback on next full render (session breaks)
 
 	// Overlay stack for modal components rendered on top of base content
 	private overlayStack: {
@@ -265,6 +267,21 @@ export class TUI extends Container {
 	 */
 	setClearOnShrink(enabled: boolean): void {
 		this.clearOnShrink = enabled;
+	}
+
+	/**
+	 * Request that the next full render clears the terminal scrollback buffer.
+	 *
+	 * Use when the session content is being replaced wholesale (workspace
+	 * transitions, new sessions, session switches) so stale scrollback
+	 * doesn't visually flow into the new content.
+	 *
+	 * Has no effect on partial (differential) redraws — the flag is consumed
+	 * only when a full render is triggered by content shrink, width change,
+	 * or forced invalidation.
+	 */
+	requestScrollbackClear(): void {
+		this.pendingScrollbackClear = true;
 	}
 
 	setFocus(component: Component | null): void {
@@ -396,6 +413,11 @@ export class TUI extends Container {
 
 	stop(): void {
 		this.stopped = true;
+		if (this.pendingRenderHandle !== undefined) {
+			clearTimeout(this.pendingRenderHandle);
+			this.pendingRenderHandle = undefined;
+			this.renderRequested = false;
+		}
 		// Move cursor to the end of the content to prevent overwriting/artifacts on exit
 		if (this.previousLines.length > 0) {
 			const targetRow = this.previousLines.length; // Line after the last content
@@ -422,11 +444,30 @@ export class TUI extends Container {
 			this.previousViewportTop = 0;
 		}
 		if (this.renderRequested) return;
+		this.scheduleRender();
+	}
+
+	/**
+	 * Schedule a single coalesced render in the check phase.
+	 *
+	 * On Bun, `setImmediate` behaves like a microtask and never enters the I/O poll
+	 * phase, so stdin data callbacks are starved during streaming. `setTimeout(fn, 0)`
+	 * forces a real timer (~1ms) that guarantees I/O polling between renders.
+	 *
+	 * On Node.js, `setTimeout(0)` has a 1ms minimum delay — slightly slower than
+	 * `setImmediate` but still imperceptible (<13ms human threshold).
+	 *
+	 * @see Plan 177 — Bun setImmediate does not yield to I/O
+	 * @returns {void}
+	 */
+	private scheduleRender(): void {
 		this.renderRequested = true;
-		process.nextTick(() => {
+		this.pendingRenderHandle = setTimeout(() => {
+			this.pendingRenderHandle = undefined;
 			this.renderRequested = false;
+			if (this.stopped) return;
 			this.doRender();
-		});
+		}, 0);
 	}
 
 	/** Input listener functions — called before the focused component receives input. */
@@ -919,11 +960,16 @@ export class TUI extends Container {
 		// Width changed - need full re-render (line wrapping changes)
 		const widthChanged = this.previousWidth !== 0 && this.previousWidth !== width;
 
-		// Helper to clear scrollback and viewport and render all new lines
+		// Helper to clear viewport (and optionally scrollback) and render all new lines
 		const fullRender = (clear: boolean): void => {
 			this.fullRedrawCount += 1;
 			let buffer = "\x1b[?2026h"; // Begin synchronized output
-			if (clear) buffer += "\x1b[3J\x1b[2J\x1b[H"; // Clear scrollback, screen, and home
+			if (clear && this.pendingScrollbackClear) {
+				buffer += "\x1b[3J\x1b[2J\x1b[H"; // Clear scrollback, screen, and home
+				this.pendingScrollbackClear = false;
+			} else if (clear) {
+				buffer += "\x1b[2J\x1b[H"; // Clear screen and home (preserve scrollback)
+			}
 			for (let i = 0; i < newLines.length; i++) {
 				if (i > 0) buffer += "\r\n";
 				buffer += newLines[i];
@@ -979,23 +1025,40 @@ export class TUI extends Container {
 			return;
 		}
 
+		// Large content shrinks (e.g., tool output collapse) are hard to partially redraw
+		// correctly — cursor positions drift when many lines disappear at once, causing
+		// ghost copies of previous frames. Force a full redraw when the shrink exceeds a
+		// threshold. More targeted than clearOnShrink (which fires on ANY shrink).
+		const shrinkDelta = this.previousLines.length - newLines.length;
+		if (shrinkDelta > 5 && this.overlayStack.length === 0) {
+			logRedraw(`large shrink (${shrinkDelta} lines)`);
+			fullRender(true);
+			return;
+		}
+
 		const previousContentViewportTop = Math.max(0, this.previousLines.length - height);
+		// Detect viewport basis drift: maxLinesRendered exceeds actual content,
+		// causing viewportTop to be computed from a stale high-water mark.
+		// Compare against newLines.length (not previousLines.length) so the
+		// correction fires on the same render cycle as a shrink, not one cycle late.
 		const hasViewportBasisDrift =
 			this.overlayStack.length === 0 &&
 			this.previousLines.length > 0 &&
-			this.maxLinesRendered > this.previousLines.length &&
+			this.maxLinesRendered > newLines.length &&
 			prevViewportTop !== previousContentViewportTop;
 
-		// Keep cursor movement and line-clear math on one viewport basis per render pass.
 		// After shrink-heavy updates with clearOnShrink disabled, maxLinesRendered can stay larger
-		// than current content. Partial redraws then risk clearing the wrong on-screen rows.
-		// Force one full redraw to realign row coordinates and preserve editor borders.
+		// than current content. Instead of a destructive full redraw (which clears the screen and
+		// disrupts scrollback), realign the working-area coordinates so the partial-redraw path
+		// can operate on a consistent viewport basis.
+		// Use newLines.length (not previousLines.length) so the correction is exact for the
+		// current frame — previousLines.length can still exceed newLines.length, leaving
+		// residual drift for one more cycle and causing ghost lines.
 		if (hasViewportBasisDrift) {
-			logRedraw(
-				`viewport basis drift (workingTop=${prevViewportTop}, contentTop=${previousContentViewportTop})`
-			);
-			fullRender(true);
-			return;
+			this.maxLinesRendered = newLines.length;
+			viewportTop = Math.max(0, this.maxLinesRendered - height);
+			prevViewportTop = viewportTop;
+			this.previousViewportTop = viewportTop;
 		}
 
 		// Find first and last changed lines
@@ -1156,13 +1219,21 @@ export class TUI extends Container {
 
 		// If we had more lines before, clear them and move cursor back
 		if (this.previousLines.length > newLines.length) {
+			const extraLines = this.previousLines.length - newLines.length;
+			// Safety guard: when extraLines exceeds terminal height, the \r\n
+			// sequence would scroll the viewport and desynchronize cursor tracking.
+			// Fall back to a full redraw instead (same guard as the deleted-lines-only path).
+			if (extraLines > height) {
+				logRedraw(`extraLines > height in diff path (${extraLines} > ${height})`);
+				fullRender(true);
+				return;
+			}
 			// Move to end of new content first if we stopped before it
 			if (renderEnd < newLines.length - 1) {
 				const moveDown = newLines.length - 1 - renderEnd;
 				buffer += `\x1b[${moveDown}B`;
 				finalCursorRow = newLines.length - 1;
 			}
-			const extraLines = this.previousLines.length - newLines.length;
 			for (let i = newLines.length; i < this.previousLines.length; i++) {
 				buffer += "\r\n\x1b[2K";
 			}
@@ -1175,6 +1246,18 @@ export class TUI extends Container {
 		if (process.env.PI_TUI_DEBUG === "1") {
 			const debugDir = "/tmp/tui";
 			fs.mkdirSync(debugDir, { recursive: true });
+
+			// Log large height fluctuations for diagnosing intermittent ghost gaps
+			const heightDelta = newLines.length - this.previousLines.length;
+			if (Math.abs(heightDelta) > 5) {
+				const fluctPath = path.join(debugDir, "height-fluctuations.log");
+				const fluctMsg =
+					`[${new Date().toISOString()}] heightFluctuation: ${heightDelta > 0 ? "+" : ""}${heightDelta} ` +
+					`(prev=${this.previousLines.length}, new=${newLines.length}, ` +
+					`maxLR=${this.maxLinesRendered}, viewportTop=${viewportTop})\n`;
+				fs.appendFileSync(fluctPath, fluctMsg);
+			}
+
 			const debugPath = path.join(
 				debugDir,
 				`render-${Date.now()}-${crypto.randomUUID().slice(0, 8)}.log`
@@ -1191,6 +1274,7 @@ export class TUI extends Container {
 				`cursorPos: ${JSON.stringify(cursorPos)}`,
 				`newLines.length: ${newLines.length}`,
 				`previousLines.length: ${this.previousLines.length}`,
+				`maxLinesRendered: ${this.maxLinesRendered}`,
 				"",
 				"=== newLines ===",
 				JSON.stringify(newLines, null, 2),
@@ -1212,8 +1296,15 @@ export class TUI extends Container {
 		// hardwareCursorRow tracks actual terminal cursor position (for movement)
 		this.cursorRow = Math.max(0, newLines.length - 1);
 		this.hardwareCursorRow = finalCursorRow;
-		// Track terminal's working area (grows but doesn't shrink unless cleared)
-		this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		// Track terminal's working area.
+		// When overlays are active, keep the high-water mark so overlay padding stays
+		// stable. When no overlays are active and content shrank, decay to actual
+		// content size — this prevents permanent ghost height from stale maxLinesRendered.
+		if (this.overlayStack.length === 0) {
+			this.maxLinesRendered = newLines.length;
+		} else {
+			this.maxLinesRendered = Math.max(this.maxLinesRendered, newLines.length);
+		}
 		this.previousViewportTop = Math.max(0, this.maxLinesRendered - height);
 
 		// Position hardware cursor for IME

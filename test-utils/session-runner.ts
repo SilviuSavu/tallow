@@ -13,6 +13,8 @@ import type { StreamFn } from "@mariozechner/pi-agent-core";
 import type { AgentSessionEvent, ExtensionFactory } from "@mariozechner/pi-coding-agent";
 import { createTallowSession, type TallowSession } from "../src/sdk-client.js";
 import { createEchoStreamFn, createMockModel } from "./mock-model.js";
+import { withExclusiveSessionRun } from "./session-run-lock.js";
+import { withExclusiveTallowHome } from "./tallow-home-env.js";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -24,6 +26,8 @@ export interface SessionRunnerOptions {
 	extensionFactories?: ExtensionFactory[];
 	/** Working directory (default: temp dir). */
 	cwd?: string;
+	/** Session settings overrides applied during creation. */
+	settings?: Record<string, unknown>;
 }
 
 /** Result from running a prompt through the session. */
@@ -64,13 +68,9 @@ export class SessionRunner {
 	 */
 	static async create(options: SessionRunnerOptions = {}): Promise<SessionRunner> {
 		const tmpDir = mkdtempSync(join(tmpdir(), "tallow-test-"));
-		const originalHome = process.env.TALLOW_HOME;
 
-		// Isolate test sessions from real config
-		process.env.TALLOW_HOME = tmpDir;
-
-		try {
-			const tallowSession = await createTallowSession({
+		const tallowSession = await withExclusiveTallowHome(tmpDir, async () => {
+			return await createTallowSession({
 				cwd: options.cwd ?? tmpDir,
 				model: createMockModel(),
 				provider: "mock",
@@ -79,21 +79,21 @@ export class SessionRunner {
 				noBundledExtensions: true,
 				noBundledSkills: true,
 				extensionFactories: options.extensionFactories,
+				settings: options.settings,
 			});
+		});
 
-			// Replace the agent's stream function with our mock
-			const streamFn = options.streamFn ?? createEchoStreamFn();
-			tallowSession.session.agent.streamFn = streamFn;
+		// Replace the agent's stream function with our mock
+		const streamFn = options.streamFn ?? createEchoStreamFn();
+		tallowSession.session.agent.streamFn = streamFn;
 
-			return new SessionRunner(tallowSession, tmpDir);
-		} finally {
-			// Restore original TALLOW_HOME so other tests aren't affected
-			if (originalHome !== undefined) {
-				process.env.TALLOW_HOME = originalHome;
-			} else {
-				delete process.env.TALLOW_HOME;
-			}
-		}
+		// Let async session_start handlers settle before first prompt.
+		await Promise.resolve();
+		await new Promise<void>((resolve) => {
+			setTimeout(resolve, 0);
+		});
+
+		return new SessionRunner(tallowSession, tmpDir);
 	}
 
 	/** The underlying AgentSession. */
@@ -113,18 +113,44 @@ export class SessionRunner {
 	 * @returns Collected events from the prompt execution
 	 */
 	async run(prompt: string): Promise<RunResult> {
-		const events: AgentSessionEvent[] = [];
-		const unsub = this._tallowSession.session.subscribe((event) => {
-			events.push(event);
+		return await withExclusiveSessionRun(async () => {
+			const events: AgentSessionEvent[] = [];
+			let resolveAgentEnd: (() => void) | undefined;
+			let sawAgentEnd = false;
+			const agentEndPromise = new Promise<void>((resolve) => {
+				resolveAgentEnd = () => {
+					if (sawAgentEnd) return;
+					sawAgentEnd = true;
+					resolve();
+				};
+			});
+			const unsub = this._tallowSession.session.subscribe((event) => {
+				events.push(event);
+				if (event.type === "agent_end") {
+					resolveAgentEnd?.();
+				}
+			});
+
+			try {
+				await this._tallowSession.session.prompt(prompt);
+				// On slower CI runners, prompt() can resolve before the final lifecycle
+				// event dispatch flushes. Wait briefly for `agent_end` so tests see a
+				// complete event sequence deterministically.
+				if (!sawAgentEnd) {
+					await Promise.race([
+						agentEndPromise,
+						new Promise<void>((resolve) => {
+							setTimeout(resolve, 25);
+						}),
+					]);
+					await Promise.resolve();
+				}
+			} finally {
+				unsub();
+			}
+
+			return { events };
 		});
-
-		try {
-			await this._tallowSession.session.prompt(prompt);
-		} finally {
-			unsub();
-		}
-
-		return { events };
 	}
 
 	/**
